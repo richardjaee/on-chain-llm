@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>On-chain LLM console — Base Sepolia</title>
+<style>
+  :root {
+    --ground:#0D1117; --panel:#151B23; --panel-2:#1C232C; --rule:#283039;
+    --ink:#E6EDF3; --ink-2:#A6B1BD; --ink-3:#76818E;
+    --accent:#4C8DFF; --accent-dim:#2B4C80; --on-accent:#0D1117;
+    --ok:#57C08A; --warn:#E3B341; --bad:#E5776B;
+    --layer:#4FB6AE; --cls:#A78BFA;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --ground:#F3F6F9; --panel:#FFFFFF; --panel-2:#EDF1F6; --rule:#D5DDE5;
+      --ink:#111820; --ink-2:#43505E; --ink-3:#67727F;
+      --accent:#1A5FD0; --accent-dim:#AAC5EE; --on-accent:#FFFFFF;
+      --ok:#1F7A4D; --warn:#8A6516; --bad:#B3392E;
+      --layer:#0F7B74; --cls:#6941C6;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--ground); color:var(--ink); font-family:var(--sans);
+         font-size:15px; line-height:1.55; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:78rem; margin:0 auto; padding:2rem 1.25rem 3rem; }
+  header { display:flex; flex-wrap:wrap; gap:.8rem; align-items:baseline; justify-content:space-between; margin-bottom:1.3rem; }
+  h1 { font-size:1.32rem; margin:0; letter-spacing:-.015em; font-weight:640; }
+  .sub { color:var(--ink-3); font-size:.86rem; margin:.25rem 0 0; }
+  .badge { font-family:var(--mono); font-size:.7rem; letter-spacing:.08em; text-transform:uppercase;
+           color:var(--accent); border:1px solid var(--accent-dim); padding:.2rem .45rem; border-radius:3px; }
+
+  .cols { display:grid; grid-template-columns:1fr; gap:1rem; align-items:start; }
+  @media (min-width:960px) { .cols { grid-template-columns: 22rem 1fr; } }
+
+  .panel { background:var(--panel); border:1px solid var(--rule); border-radius:8px; padding:1.15rem 1.2rem; }
+  .panel + .panel { margin-top:1rem; }
+  .panel h2 { font-size:.7rem; font-family:var(--mono); letter-spacing:.11em; text-transform:uppercase;
+              color:var(--ink-3); margin:0 0 .85rem; font-weight:500; }
+
+  label { display:block; font-size:.8rem; color:var(--ink-2); margin:0 0 .35rem; }
+  textarea, input[type=text] {
+    width:100%; background:var(--panel-2); color:var(--ink); border:1px solid var(--rule);
+    border-radius:4px; padding:.6rem .7rem; font-family:var(--mono); font-size:.92rem;
+  }
+  textarea { resize:vertical; min-height:3.2rem; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  .field + .field { margin-top:1rem; }
+  .hint { font-size:.79rem; color:var(--ink-3); margin:.45rem 0 0; }
+
+  .actions { display:flex; gap:.55rem; align-items:center; margin-top:1.1rem; flex-wrap:wrap; }
+  button { font:inherit; font-size:.9rem; font-weight:600; cursor:pointer; background:var(--accent);
+           color:var(--on-accent); border:none; padding:.6rem 1.25rem; border-radius:4px; }
+  button.ghost { background:transparent; color:var(--ink-2); border:1px solid var(--rule); font-weight:500; padding:.53rem .85rem; }
+  button:disabled { opacity:.4; cursor:not-allowed; }
+  button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+
+  .status { font-size:.85rem; color:var(--ink-3); margin-top:.9rem; min-height:1.3em; }
+  .status.busy { color:var(--warn); } .status.ok { color:var(--ok); } .status.bad { color:var(--bad); }
+
+  .story { font-family:var(--mono); font-size:1.1rem; line-height:1.75; background:var(--panel-2);
+           border:1px solid var(--rule); border-left:3px solid var(--accent); border-radius:4px;
+           padding:1rem 1.05rem; min-height:4.5rem; white-space:pre-wrap; word-break:break-word; }
+  #storyPrompt { color:var(--ink-3); }
+  #storyNew { background:var(--accent); color:var(--on-accent); border-radius:2px; padding:.02em .12em; }
+  .track { height:4px; background:var(--panel-2); border-radius:2px; overflow:hidden; margin-top:.85rem; }
+  #bar { height:100%; width:0; background:var(--accent); transition:width .35s ease; }
+  @media (prefers-reduced-motion:reduce) { #bar { transition:none; } }
+
+  .metrics { display:flex; gap:1.7rem; flex-wrap:wrap; margin:.9rem 0 0; }
+  .metrics div { display:flex; flex-direction:column; }
+  .metrics dt { font-family:var(--mono); font-size:.63rem; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-3); }
+  .metrics .val { font-family:var(--mono); font-size:1rem; font-variant-numeric:tabular-nums; }
+  .val.ok { color:var(--ok); } .val.busy { color:var(--warn); }
+
+  /* ---- transaction feed ---- */
+  #feed { max-height:34rem; overflow-y:auto; display:flex; flex-direction:column; gap:.5rem; }
+  .tx { border:1px solid var(--rule); border-left:3px solid var(--layer); border-radius:4px;
+        background:var(--panel-2); padding:.6rem .75rem; }
+  .tx.cls { border-left-color:var(--cls); }
+  .tx.note { border-left-color:var(--warn); }
+  .tx.err  { border-left-color:var(--bad); }
+  .tx-head { display:flex; gap:.6rem; align-items:baseline; flex-wrap:wrap; font-family:var(--mono); font-size:.78rem; }
+  .tx-n { color:var(--ink-3); }
+  .tx-kind { font-weight:600; color:var(--layer); }
+  .tx.cls .tx-kind { color:var(--cls); }
+  .tx-pos { color:var(--ink-3); }
+  .tx-gas { margin-left:auto; color:var(--ink-3); font-variant-numeric:tabular-nums; }
+  .tx-ops { font-size:.76rem; color:var(--ink-2); margin-top:.28rem; line-height:1.45; }
+  .tx-emit { margin-top:.35rem; font-family:var(--mono); font-size:.8rem; color:var(--ok); }
+  .tx-emit .piece { background:var(--ok); color:var(--ground); padding:.02em .3em; border-radius:2px; }
+  .tx a { color:var(--accent); text-decoration:none; }
+  .tx a:hover { text-decoration:underline; }
+
+  details { margin-top:1rem; border-top:1px solid var(--rule); padding-top:.85rem; }
+  summary { cursor:pointer; font-size:.81rem; color:var(--ink-3); }
+  summary:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  .kv { display:flex; gap:1.5rem; flex-wrap:wrap; margin-top:.75rem; }
+  .kv div { display:flex; flex-direction:column; min-width:0; }
+  .kv dt { font-family:var(--mono); font-size:.63rem; letter-spacing:.1em; text-transform:uppercase; color:var(--ink-3); }
+  .kv dd { margin:0; font-family:var(--mono); font-size:.76rem; word-break:break-all; }
+  code { font-family:var(--mono); background:var(--panel-2); padding:.06em .3em; border-radius:3px; font-size:.86em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div>
+      <h1>On-chain LLM console</h1>
+      <p class="sub">A 260K-parameter transformer executing as EVM opcodes. Every token is computed on chain.</p>
+    </div>
+    <div style="display:flex; gap:.55rem; align-items:center;">
+      <span class="badge">Base Sepolia</span>
+      <span id="acct" style="font-family:var(--mono); font-size:.78rem; color:var(--ink-3)">—</span>
+    </div>
+  </header>
+
+  <div class="cols">
+
+    <!-- ---------------- left: controls ---------------- -->
+    <div>
+      <div class="panel">
+        <h2>Prompt</h2>
+        <div class="field">
+          <textarea id="prompt" spellcheck="false">Once upon a time</textarea>
+        </div>
+        <div class="field">
+          <label for="maxnew">Tokens to generate — <span id="maxnewOut">12</span></label>
+          <input type="range" id="maxnew" min="1" max="40" value="12">
+          <p class="hint" id="estimate"></p>
+        </div>
+        <div class="actions">
+          <button id="go">Generate</button>
+          <button id="stop" class="ghost" disabled>Stop</button>
+          <button id="refresh" class="ghost">Refresh</button>
+          <button id="clear" class="ghost">Clear</button>
+        </div>
+        <p class="status" id="status">Press Generate. Your wallet asks for one approval, then it runs on its own.</p>
+      </div>
+
+      <div class="panel">
+        <h2>What one transaction does</h2>
+        <p class="hint" style="margin-top:0">
+          The model has <strong>5 layers</strong>. Each transaction computes exactly one of
+          them for the current token position, then writes the residual stream and that
+          layer's KV cache back to storage. A sixth transaction runs the classifier and
+          emits the token. So one token = <strong>6 transactions</strong>.
+        </p>
+        <details>
+          <summary>Signing key &amp; contract</summary>
+          <p class="hint">
+            Approving six transactions per token by hand is unusable, so a throwaway key is
+            created in this page, funded by your single approval, and signs every step. It is
+            kept in this browser only (so leftover funds stay recoverable after a reload) and never transmitted. <strong>Testnet only — never import a key with real funds.</strong>
+          </p>
+          <dl class="kv">
+            <div><dt>Session address</dt><dd id="sessAddr">not created yet</dd></div>
+            <div><dt>Balance</dt><dd id="sessBal">0.00000 ETH</dd></div>
+          </dl>
+          <dl class="kv">
+            <div style="flex:1"><dt>Session key (in-memory)</dt><dd id="sessKey">—</dd></div>
+          </dl>
+          <div class="actions"><button id="sweep" class="ghost">Return leftover funds</button><button id="newkey" class="ghost">New key</button></div>
+          <div class="field" style="margin-top:.9rem">
+            <label for="addr">Contract</label>
+            <input type="text" id="addr" spellcheck="false">
+          </div>
+        </details>
+      </div>
+    </div>
+
+    <!-- ---------------- right: output + live feed ---------------- -->
+    <div>
+      <div class="panel">
+        <h2>Output — read from contract storage</h2>
+        <div class="story" id="story"><span id="storyPrompt"></span><span id="storyOld"></span><span id="storyNew"></span></div>
+        <p class="hint" id="carry" style="margin-top:.55rem"></p>
+        <div class="track"><div id="bar"></div></div>
+        <dl class="metrics">
+          <div><dt>Generated</dt><span class="val" id="mGen">–</span></div>
+          <div><dt>Position</dt><span class="val" id="mPos">–</span></div>
+          <div><dt>Transactions</dt><span class="val" id="mSteps">–</span></div>
+          <div><dt>Gas used</dt><span class="val" id="mGas">–</span></div>
+          <div><dt>State</dt><span class="val" id="mDone">–</span></div>
+        </dl>
+      </div>
+
+      <div class="panel">
+        <h2>Transactions — decoded from receipt events</h2>
+        <div id="feed"><div class="tx note"><div class="tx-head"><span class="tx-kind">idle</span></div>
+          <div class="tx-ops">Each transaction below is decoded from the contract's own
+          <code>StepRun</code> and <code>TokenEmitted</code> events, so it shows exactly which
+          layer ran and which token was produced.</div></div></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script src="ethers.umd.min.js"></script>
+<script src="_tok_inline.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

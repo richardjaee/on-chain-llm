@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 pragma solidity ^0.8.20;
 
 import {Test, console2} from "forge-std/Test.sol";
@@ -22,8 +22,16 @@ contract TransformerTest is Test {
         blob = vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/model.hex"))));
         spec = vm.readFile(string.concat(root, "/artifacts/spec_vectors.json"));
         cfg = Transformer.Config({
-            dim: 64, hidden: 172, nLayers: 5, nHeads: 8, nKv: 4,
-            vocab: 512, seqLen: 512, hs: 8, kvd: 32, shared: true,
+            dim: 64,
+            hidden: 172,
+            nLayers: 5,
+            nHeads: 8,
+            nKv: 4,
+            vocab: 512,
+            seqLen: 512,
+            hs: 8,
+            kvd: 32,
+            shared: true,
             invSqrtHs: uint64((uint256(1) << 32) / 2) // 1/sqrt(8) handled below
         });
         // 2^32 / sqrt(8), computed with the same integer sqrt the model uses
@@ -57,11 +65,15 @@ contract TransformerTest is Test {
 
     function test_RmsnormRunsAndIsFinite() public view {
         int256[] memory x = new int256[](cfg.dim);
-        for (uint256 i = 0; i < cfg.dim; ++i) x[i] = int256(1 << 30) + int256(i);
+        for (uint256 i = 0; i < cfg.dim; ++i) {
+            x[i] = int256(1 << 30) + int256(i);
+        }
         int256[] memory out = new int256[](cfg.dim);
         Transformer.rmsnorm(blob, lay.rmsAtt, 0, x, out, cfg.dim);
         bool any;
-        for (uint256 i = 0; i < cfg.dim; ++i) if (out[i] != 0) any = true;
+        for (uint256 i = 0; i < cfg.dim; ++i) {
+            if (out[i] != 0) any = true;
+        }
         assertTrue(any, "rmsnorm produced all zeros");
         console2.log("rmsnorm out[0]:", out[0]);
     }

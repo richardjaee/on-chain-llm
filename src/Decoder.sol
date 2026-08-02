@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 pragma solidity ^0.8.20;
 
 import {WeightStore} from "./WeightStore.sol";
@@ -32,11 +32,15 @@ library Decoder {
                 ? (uint256(uint8(table[offBase + (id + 1) * 2])) << 8 | uint256(uint8(table[offBase + (id + 1) * 2 + 1])))
                 : table.length - strBase;
             bytes memory piece = new bytes(e - s);
-            for (uint256 j = 0; j < e - s; ++j) piece[j] = table[strBase + s + j];
+            for (uint256 j = 0; j < e - s; ++j) {
+                piece[j] = table[strBase + s + j];
+            }
             // the piece after BOS drops a leading space
             if (prev == BOS && piece.length > 0 && piece[0] == 0x20) {
                 bytes memory t = new bytes(piece.length - 1);
-                for (uint256 j = 1; j < piece.length; ++j) t[j - 1] = piece[j];
+                for (uint256 j = 1; j < piece.length; ++j) {
+                    t[j - 1] = piece[j];
+                }
                 piece = t;
             }
             out = bytes.concat(out, piece);

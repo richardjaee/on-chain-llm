@@ -1,6 +1,20 @@
+# Foundry
 out/
 cache/
 broadcast/
+
+# Python
 venv/
+__pycache__/
+
+# Model checkpoints — fetched, not vendored
 *.bin
+
+# Secrets: RPC URLs, deployer keys. Never commit these.
+.env
+.env.*
+*.key
+*.pem
+
+# macOS
 .DS_Store

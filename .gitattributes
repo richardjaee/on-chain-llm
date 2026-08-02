@@ -1,0 +1,9 @@
+* text=auto eol=lf
+
+# Vendored third-party code — excluded from language statistics
+frontend/ethers.umd.min.js linguist-vendored
+tools/llama2-reference.c   linguist-vendored
+
+# Build products of tools/convert.py — large, machine-generated, not for review
+artifacts/*.hex   linguist-generated -diff
+artifacts/*.json  linguist-generated -diff

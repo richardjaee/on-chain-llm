@@ -10,7 +10,8 @@ function makeTok512(spec) {
     for (let i = 0; i < b.length; i++) b[i] = parseInt(hex.substr(i * 2, 2), 16);
     return { score, bytes: b, key: hex };
   });
-  // first id wins on duplicates, matching reference.py's lookup construction
+  // first id wins on duplicates, so a piece present at several ids always encodes
+  // to the lowest — the table in artifacts/tokens.hex is ordered to match
   const lookup = new Map();
   toks.forEach((t, i) => { if (!lookup.has(t.key)) lookup.set(t.key, i); });
 

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 pragma solidity ^0.8.20;
 
 import {FixedPoint} from "./FixedPoint.sol";
@@ -148,22 +148,22 @@ library Transformer {
                     let word := mload(add(rp, shl(1, j)))
                     let xj := add(xp, shl(5, j))
                     // unrolled: constant shifts, no inner loop counter
-                        acc := add(acc, mul(signextend(1, shr(240, word)), mload(add(xj, 0))))
-                        acc := add(acc, mul(signextend(1, shr(224, word)), mload(add(xj, 32))))
-                        acc := add(acc, mul(signextend(1, shr(208, word)), mload(add(xj, 64))))
-                        acc := add(acc, mul(signextend(1, shr(192, word)), mload(add(xj, 96))))
-                        acc := add(acc, mul(signextend(1, shr(176, word)), mload(add(xj, 128))))
-                        acc := add(acc, mul(signextend(1, shr(160, word)), mload(add(xj, 160))))
-                        acc := add(acc, mul(signextend(1, shr(144, word)), mload(add(xj, 192))))
-                        acc := add(acc, mul(signextend(1, shr(128, word)), mload(add(xj, 224))))
-                        acc := add(acc, mul(signextend(1, shr(112, word)), mload(add(xj, 256))))
-                        acc := add(acc, mul(signextend(1, shr(96, word)), mload(add(xj, 288))))
-                        acc := add(acc, mul(signextend(1, shr(80, word)), mload(add(xj, 320))))
-                        acc := add(acc, mul(signextend(1, shr(64, word)), mload(add(xj, 352))))
-                        acc := add(acc, mul(signextend(1, shr(48, word)), mload(add(xj, 384))))
-                        acc := add(acc, mul(signextend(1, shr(32, word)), mload(add(xj, 416))))
-                        acc := add(acc, mul(signextend(1, shr(16, word)), mload(add(xj, 448))))
-                        acc := add(acc, mul(signextend(1, shr(0, word)), mload(add(xj, 480))))
+                    acc := add(acc, mul(signextend(1, shr(240, word)), mload(add(xj, 0))))
+                    acc := add(acc, mul(signextend(1, shr(224, word)), mload(add(xj, 32))))
+                    acc := add(acc, mul(signextend(1, shr(208, word)), mload(add(xj, 64))))
+                    acc := add(acc, mul(signextend(1, shr(192, word)), mload(add(xj, 96))))
+                    acc := add(acc, mul(signextend(1, shr(176, word)), mload(add(xj, 128))))
+                    acc := add(acc, mul(signextend(1, shr(160, word)), mload(add(xj, 160))))
+                    acc := add(acc, mul(signextend(1, shr(144, word)), mload(add(xj, 192))))
+                    acc := add(acc, mul(signextend(1, shr(128, word)), mload(add(xj, 224))))
+                    acc := add(acc, mul(signextend(1, shr(112, word)), mload(add(xj, 256))))
+                    acc := add(acc, mul(signextend(1, shr(96, word)), mload(add(xj, 288))))
+                    acc := add(acc, mul(signextend(1, shr(80, word)), mload(add(xj, 320))))
+                    acc := add(acc, mul(signextend(1, shr(64, word)), mload(add(xj, 352))))
+                    acc := add(acc, mul(signextend(1, shr(48, word)), mload(add(xj, 384))))
+                    acc := add(acc, mul(signextend(1, shr(32, word)), mload(add(xj, 416))))
+                    acc := add(acc, mul(signextend(1, shr(16, word)), mload(add(xj, 448))))
+                    acc := add(acc, mul(signextend(1, shr(0, word)), mload(add(xj, 480))))
                 }
                 // tail: fewer than sixteen columns remain, so walk the final word's
                 // leading lanes with the same shift arithmetic as above
@@ -182,14 +182,10 @@ library Transformer {
 
     /// @notice x_i * g_i / sqrt(mean(x^2) + eps), all Q32
     /// @dev `gBase` is the 1-row tensor block; `gOff` indexes within its values.
-    function rmsnorm(
-        bytes memory w,
-        uint256 gBase,
-        uint256 gOff,
-        int256[] memory x,
-        int256[] memory out,
-        uint256 dim
-    ) internal pure {
+    function rmsnorm(bytes memory w, uint256 gBase, uint256 gOff, int256[] memory x, int256[] memory out, uint256 dim)
+        internal
+        pure
+    {
         uint256 gShift = _u8(w, gBase);
         uint256 vals = gBase + 1;
         int256 ss = 0;
@@ -226,15 +222,15 @@ library Transformer {
 
     /// @notice Per-run activation buffers and the KV cache
     struct Buffers {
-        int256[] resid;    // residual stream carried through the layers
-        int256[] normed;   // RMSNorm output feeding the projections
+        int256[] resid; // residual stream carried through the layers
+        int256[] normed; // RMSNorm output feeding the projections
         int256[] query;
         int256[] key;
         int256[] value;
-        int256[] attnOut;  // concatenated head outputs
-        int256[] proj;     // scratch for W_o and W_2 results
-        int256[] gate;     // SwiGLU gate branch, reused for the activated product
-        int256[] up;       // SwiGLU up branch
+        int256[] attnOut; // concatenated head outputs
+        int256[] proj; // scratch for W_o and W_2 results
+        int256[] gate; // SwiGLU gate branch, reused for the activated product
+        int256[] up; // SwiGLU up branch
         int256[] logits;
         int256[] keyCache;
         int256[] valueCache;
@@ -260,10 +256,7 @@ library Transformer {
     }
 
     /// @dev Load the token embedding row and scale it up into the Q32 residual stream
-    function embed(bytes memory w, Layout memory o, Config memory c, Buffers memory b, uint256 token)
-        internal
-        pure
-    {
+    function embed(bytes memory w, Layout memory o, Config memory c, Buffers memory b, uint256 token) internal pure {
         uint256 shift = _u8(w, o.tokEmb + token);
         uint256 vals = o.tokEmb + c.vocab + token * uint256(c.dim) * 2;
         uint256 up = FixedPoint.F - shift;
@@ -337,7 +330,9 @@ library Transformer {
                 _head(c, b, l * b.maxPos * c.kvd, h * c.hs, (h / kvMul) * c.hs, pos + 1);
             }
             matmul(w, o.wo, uint256(c.nLayers) * dim, l * dim, dim, dim, b.attnOut, b.proj, 0);
-            for (uint256 i = 0; i < dim; ++i) b.resid[i] += b.proj[i];
+            for (uint256 i = 0; i < dim; ++i) {
+                b.resid[i] += b.proj[i];
+            }
 
             rmsnorm(w, o.rmsFfn, l * dim, b.resid, b.normed, dim);
             matmul(w, o.w1, uint256(c.nLayers) * c.hidden, l * c.hidden, c.hidden, dim, b.normed, b.gate, 0);
@@ -346,7 +341,9 @@ library Transformer {
                 b.gate[i] = (FixedPoint.silu(b.gate[i]) * b.up[i]) >> FixedPoint.F;
             }
             matmul(w, o.w2, uint256(c.nLayers) * dim, l * dim, dim, c.hidden, b.gate, b.proj, 0);
-            for (uint256 i = 0; i < dim; ++i) b.resid[i] += b.proj[i];
+            for (uint256 i = 0; i < dim; ++i) {
+                b.resid[i] += b.proj[i];
+            }
         }
     }
 

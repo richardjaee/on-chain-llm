@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 pragma solidity ^0.8.20;
 
 import {Test, console2} from "forge-std/Test.sol";
@@ -21,7 +21,8 @@ contract ResumableTest is Test {
         bytes memory blob = vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/model.hex"))));
 
         // token table: [u16 count][u8 maxLen][u16 offset per token][bytes]
-        bytes memory table = vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/tokens.hex"))));
+        bytes memory table =
+            vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/tokens.hex"))));
         address tokPtr = WeightStore.write(table);
 
         bytes memory dir = abi.encodePacked(tokPtr);
@@ -40,8 +41,17 @@ contract ResumableTest is Test {
         }
 
         Transformer.Config memory c = Transformer.Config({
-            dim: 64, hidden: 172, nLayers: 5, nHeads: 8, nKv: 4,
-            vocab: 512, seqLen: 512, hs: 8, kvd: 32, shared: true, invSqrtHs: 0
+            dim: 64,
+            hidden: 172,
+            nLayers: 5,
+            nHeads: 8,
+            nKv: 4,
+            vocab: 512,
+            seqLen: 512,
+            hs: 8,
+            kvd: 32,
+            shared: true,
+            invSqrtHs: 0
         });
         llm = new OnchainLLM(WeightStore.write(dir), c);
     }
@@ -52,7 +62,9 @@ contract ResumableTest is Test {
         uint256[] memory want = spec.readUintArray(".gen");
 
         uint16[] memory prompt = new uint16[](promptRaw.length);
-        for (uint256 i = 0; i < promptRaw.length; ++i) prompt[i] = uint16(promptRaw[i]);
+        for (uint256 i = 0; i < promptRaw.length; ++i) {
+            prompt[i] = uint16(promptRaw[i]);
+        }
 
         llm.start(prompt, want.length);
         uint256 guard;

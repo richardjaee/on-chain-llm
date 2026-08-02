@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 pragma solidity ^0.8.20;
 
 import {Decoder} from "./Decoder.sol";
@@ -95,7 +95,9 @@ contract OnchainLLM {
         Transformer.Config memory c = config();
         if (ids.length == 0 || ids.length >= c.seqLen) revert PromptTooLong();
         delete promptIds;
-        for (uint256 i = 0; i < ids.length; ++i) promptIds.push(ids[i]);
+        for (uint256 i = 0; i < ids.length; ++i) {
+            promptIds.push(ids[i]);
+        }
         delete generated;
         uint256 mp = ids.length + maxNew;
         if (mp > c.seqLen) mp = c.seqLen;
@@ -128,7 +130,9 @@ contract OnchainLLM {
         uint256 lo = layer;
         Transformer.Buffers memory b = Transformer.newBuffers(c, maxPos);
         int256[] memory xs = _x;
-        for (uint256 i = 0; i < c.dim; ++i) b.resid[i] = xs[i];
+        for (uint256 i = 0; i < c.dim; ++i) {
+            b.resid[i] = xs[i];
+        }
 
         if (lo == c.nLayers) {
             // classifier stage — skipped entirely while still inside the prompt,
@@ -163,7 +167,9 @@ contract OnchainLLM {
             }
         }
 
-        for (uint256 i = 0; i < c.dim; ++i) xs[i] = b.resid[i];
+        for (uint256 i = 0; i < c.dim; ++i) {
+            xs[i] = b.resid[i];
+        }
         _x = xs;
         layer = l;
         steps += ran;
@@ -217,7 +223,9 @@ contract OnchainLLM {
         uint256 n = d.length / 20 - 1;
         tokPtr = _addr(d, 0);
         chunks = new address[](n);
-        for (uint256 i = 0; i < n; ++i) chunks[i] = _addr(d, (i + 1) * 20);
+        for (uint256 i = 0; i < n; ++i) {
+            chunks[i] = _addr(d, (i + 1) * 20);
+        }
     }
 
     function _addr(bytes memory d, uint256 off) private pure returns (address a) {

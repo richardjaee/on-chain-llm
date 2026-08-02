@@ -7,11 +7,16 @@ multiply-accumulate executes as EVM opcodes.
 Live on Base Sepolia: [`0x77D4fd6B1fcA991d586c75A94008441947B8Eb0b`](https://sepolia.basescan.org/address/0x77D4fd6B1fcA991d586c75A94008441947B8Eb0b)
 
 ```
-prompt : Once upon a time
+prompt : Once upon a time          (5 tokens, maxNew = 8)
 output : , there was a little girl
 
 72 transactions · 256,410,750 gas · peak 11,928,695 per transaction
 ```
+
+Those figures are for that run, not constants of the model. Per-transaction cost rises
+with `maxNew` — `step` sizes its KV buffers for `maxPos` on every call — and with
+position, as attention reads more of the cache. A longer generation costs more per
+transaction from the very first one.
 
 ## Why it takes many transactions
 
@@ -101,8 +106,32 @@ over the KV range (online softmax), which bounds context length at large model d
 
 ## Licence and credits
 
-MIT. The model is Andrej Karpathy's `stories260K` checkpoint trained on TinyStories, and
-the inference algorithm — RMSNorm, RoPE, grouped-query attention, SwiGLU, greedy decoding —
-follows [llama2.c](https://github.com/karpathy/llama2.c) (MIT, `LICENSE-llama2c`). The
-fixed-point formulation, per-row quantisation, weight layout, streaming reader, and the
-resumable execution model are original to this project.
+Copyright (c) 2026 Richard Chung. Released under the
+[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)
+licence (`LICENSE`) — free to read, run, modify, and share for any noncommercial purpose,
+including personal projects, research, and use by educational or nonprofit institutions.
+Commercial use requires permission; open an issue or get in touch.
+
+Note that this is a source-available licence, not an OSI-approved open source one. The
+fixed-point formulation, per-row quantisation, weight layout, streaming reader, resumable
+execution model, contracts, and frontend are original to this project.
+
+The inference algorithm — RMSNorm, RoPE, grouped-query attention, SwiGLU, greedy decoding —
+follows Andrej Karpathy's [llama2.c](https://github.com/karpathy/llama2.c) (MIT,
+`LICENSE-llama2c`). `tools/llama2-reference.c` is that project's `run.c` vendored
+unmodified as a readable reference; nothing here compiles against it.
+
+Third-party components keep their own licences, which are unaffected by the terms above
+and remain permissive:
+
+| Component | Licence |
+|---|---|
+| [llama2.c](https://github.com/karpathy/llama2.c) `run.c`, vendored | MIT — `LICENSE-llama2c` |
+| [ethers.js](https://github.com/ethers-io/ethers.js) v6.13.4, vendored | MIT — `frontend/LICENSE-ethers` |
+| [forge-std](https://github.com/foundry-rs/forge-std), submodule | MIT / Apache-2.0 |
+
+The weights in `artifacts/` are quantised from the `stories260K` checkpoint, distributed
+via [karpathy/tinyllamas](https://huggingface.co/karpathy/tinyllamas) and trained on
+[TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) (CDLA-Sharing-1.0).
+That checkpoint carries no licence file of its own; the licence above covers this
+project's code, not the model weights.

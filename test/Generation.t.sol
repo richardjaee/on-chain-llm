@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 pragma solidity ^0.8.20;
 
 import {Test, console2} from "forge-std/Test.sol";
@@ -19,8 +19,16 @@ contract GenerationTest is Test {
         string memory root = vm.projectRoot();
         blob = vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/model.hex"))));
         cfg = Transformer.Config({
-            dim: 64, hidden: 172, nLayers: 5, nHeads: 8, nKv: 4,
-            vocab: 512, seqLen: 512, hs: 8, kvd: 32, shared: true,
+            dim: 64,
+            hidden: 172,
+            nLayers: 5,
+            nHeads: 8,
+            nKv: 4,
+            vocab: 512,
+            seqLen: 512,
+            hs: 8,
+            kvd: 32,
+            shared: true,
             invSqrtHs: uint64((uint256(1) << 64) / FixedPoint.isqrt(uint256(8) << 64))
         });
         lay = Transformer.layout(cfg);
@@ -46,7 +54,9 @@ contract GenerationTest is Test {
             }
             token = next;
         }
-        assembly { mstore(gen, n) }
+        assembly {
+            mstore(gen, n)
+        }
     }
 
     /// @notice argmax after the first prompt token must match the spec
@@ -75,7 +85,9 @@ contract GenerationTest is Test {
         uint256[] memory want = spec.readUintArray(".gen");
 
         uint16[] memory prompt = new uint16[](promptRaw.length);
-        for (uint256 i = 0; i < promptRaw.length; ++i) prompt[i] = uint16(promptRaw[i]);
+        for (uint256 i = 0; i < promptRaw.length; ++i) {
+            prompt[i] = uint16(promptRaw[i]);
+        }
 
         uint256[] memory got = _generate(prompt, want.length);
         assertEq(got.length, want.length, "token count differs");

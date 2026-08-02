@@ -1,4 +1,16 @@
-/* Inference for Llama-2 Transformer model in pure C */
+/* Inference for Llama-2 Transformer model in pure C
+ *
+ * VENDORED, UNMODIFIED. This is run.c from https://github.com/karpathy/llama2.c
+ * at commit 2fbf7059aab6f7e44047da1ff5c0ba53057a248e.
+ *
+ * Copyright (c) 2023 Andrej Karpathy, MIT licensed — see LICENSE-llama2c in the
+ * repository root for the full notice.
+ *
+ * Nothing in this project compiles or links against this file. It is kept as the
+ * readable reference for the algorithm that tools/intref.py and tools/model.py
+ * reimplement in integer arithmetic, and that src/Transformer.sol implements in
+ * the EVM, so a reader can check those ports against the original.
+ */
 
 #include <stdio.h>
 #include <stdlib.h>

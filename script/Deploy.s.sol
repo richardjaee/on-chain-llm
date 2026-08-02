@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 pragma solidity ^0.8.20;
 
 import {Script, console} from "forge-std/Script.sol";
@@ -14,7 +14,8 @@ contract DeployScript is Script {
     function run() public {
         string memory root = vm.projectRoot();
         bytes memory blob = vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/model.hex"))));
-        bytes memory table = vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/tokens.hex"))));
+        bytes memory table =
+            vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/tokens.hex"))));
 
         vm.startBroadcast();
 
@@ -32,8 +33,17 @@ contract DeployScript is Script {
         llm = new OnchainLLM(
             dirPtr,
             Transformer.Config({
-                dim: 64, hidden: 172, nLayers: 5, nHeads: 8, nKv: 4,
-                vocab: 512, seqLen: 512, hs: 8, kvd: 32, shared: true, invSqrtHs: 0
+                dim: 64,
+                hidden: 172,
+                nLayers: 5,
+                nHeads: 8,
+                nKv: 4,
+                vocab: 512,
+                seqLen: 512,
+                hs: 8,
+                kvd: 32,
+                shared: true,
+                invSqrtHs: 0
             })
         );
 

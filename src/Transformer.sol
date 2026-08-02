@@ -236,9 +236,31 @@ library Transformer {
         int256[] valueCache;
         int256[] attnWeights;
         uint256 maxPos;
+        /// @dev Number of layers the KV cache holds. The resumable path runs one layer
+        ///      per call and reloads from storage each time, so it allocates a single
+        ///      layer and indexes it at slot 0; a whole-pass caller needs all of them.
+        uint256 cacheLayers;
     }
 
+    /// @dev Which slot of the KV cache layer `l` occupies
+    function slotOf(Buffers memory b, uint256 l) internal pure returns (uint256) {
+        return b.cacheLayers == 1 ? 0 : l;
+    }
+
+    /// @notice Buffers holding every layer's KV cache, for running a whole pass at once
     function newBuffers(Config memory c, uint256 maxPos) internal pure returns (Buffers memory b) {
+        return newBuffers(c, maxPos, c.nLayers);
+    }
+
+    /// @notice Buffers holding `cacheLayers` layers of KV cache over `maxPos` positions.
+    /// @dev The KV cache dominates this allocation and EVM memory is quadratic, so
+    ///      sizing it to what the call actually touches — rather than to the worst case
+    ///      the session might eventually reach — is worth real gas on every transaction.
+    function newBuffers(Config memory c, uint256 maxPos, uint256 cacheLayers)
+        internal
+        pure
+        returns (Buffers memory b)
+    {
         b.resid = new int256[](c.dim);
         b.normed = new int256[](c.dim);
         b.query = new int256[](c.dim);
@@ -249,10 +271,11 @@ library Transformer {
         b.gate = new int256[](c.hidden);
         b.up = new int256[](c.hidden);
         b.logits = new int256[](c.vocab);
-        b.keyCache = new int256[](uint256(c.nLayers) * maxPos * c.kvd);
-        b.valueCache = new int256[](uint256(c.nLayers) * maxPos * c.kvd);
+        b.keyCache = new int256[](cacheLayers * maxPos * c.kvd);
+        b.valueCache = new int256[](cacheLayers * maxPos * c.kvd);
         b.attnWeights = new int256[](maxPos);
         b.maxPos = maxPos;
+        b.cacheLayers = cacheLayers;
     }
 
     /// @dev Load the token embedding row and scale it up into the Q32 residual stream
@@ -319,7 +342,7 @@ library Transformer {
             rope(w, o, c, b.query, c.nHeads, pos);
             rope(w, o, c, b.key, c.nKv, pos);
 
-            uint256 row = (l * b.maxPos + pos) * c.kvd;
+            uint256 row = (slotOf(b, l) * b.maxPos + pos) * c.kvd;
             for (uint256 i = 0; i < c.kvd; ++i) {
                 b.keyCache[row + i] = b.key[i];
                 b.valueCache[row + i] = b.value[i];
@@ -327,7 +350,7 @@ library Transformer {
 
             uint256 kvMul = c.nHeads / c.nKv;
             for (uint256 h = 0; h < c.nHeads; ++h) {
-                _head(c, b, l * b.maxPos * c.kvd, h * c.hs, (h / kvMul) * c.hs, pos + 1);
+                _head(c, b, slotOf(b, l) * b.maxPos * c.kvd, h * c.hs, (h / kvMul) * c.hs, pos + 1);
             }
             matmul(w, o.wo, uint256(c.nLayers) * dim, l * dim, dim, dim, b.attnOut, b.proj, 0);
             for (uint256 i = 0; i < dim; ++i) {

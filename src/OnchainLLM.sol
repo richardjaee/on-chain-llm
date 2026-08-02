@@ -128,7 +128,12 @@ contract OnchainLLM {
 
         uint256 p = pos;
         uint256 lo = layer;
-        Transformer.Buffers memory b = Transformer.newBuffers(c, maxPos);
+        // Size the KV cache to this transaction, not to the session: one layer, because
+        // every layer is loaded from and stored back to storage individually, and only
+        // the positions attention will actually read. EVM memory is quadratic, so the
+        // difference between this and `nLayers * maxPos` is worth hundreds of thousands
+        // of gas on every transaction — and the saving grows with the requested maxNew.
+        Transformer.Buffers memory b = Transformer.newBuffers(c, lo == c.nLayers ? 1 : p + 1, 1);
         int256[] memory xs = _x;
         for (uint256 i = 0; i < c.dim; ++i) {
             b.resid[i] = xs[i];
@@ -272,7 +277,7 @@ contract OnchainLLM {
     function _loadKv(Transformer.Config memory c, Transformer.Buffers memory b, uint256 l, uint256 p) private view {
         uint256 kvd = c.kvd;
         for (uint256 t = 0; t < p; ++t) {
-            uint256 row = (l * b.maxPos + t) * kvd;
+            uint256 row = (Transformer.slotOf(b, l) * b.maxPos + t) * kvd;
             for (uint256 i = 0; i < kvd; i += PACK_N) {
                 uint256 ks = _kv[_key(c, false, l, t, i / PACK_N)];
                 uint256 vs = _kv[_key(c, true, l, t, i / PACK_N)];
@@ -287,7 +292,7 @@ contract OnchainLLM {
 
     function _storeKv(Transformer.Config memory c, Transformer.Buffers memory b, uint256 l, uint256 p) private {
         uint256 kvd = c.kvd;
-        uint256 row = (l * b.maxPos + p) * kvd;
+        uint256 row = (Transformer.slotOf(b, l) * b.maxPos + p) * kvd;
         for (uint256 i = 0; i < kvd; i += PACK_N) {
             uint256 n = kvd - i < PACK_N ? kvd - i : PACK_N;
             _kv[_key(c, false, l, p, i / PACK_N)] = _pack(b.keyCache, row + i, n);

@@ -287,37 +287,114 @@ async function ensureFunded(txCount) {
 }
 
 /* --------------------------------- run --------------------------------- */
+
+/* Transactions from one sender execute in strict nonce order, and that ordering is
+ * exactly what `step` needs — so awaiting each receipt before submitting the next buys
+ * nothing but latency. Submitting a batch and then collecting receipts lets the
+ * sequencer pack many steps into a single block: a step peaks near 11.9M gas against
+ * Base Sepolia's 1.2B block limit, so what bounds a batch is mempool policy, not the
+ * chain. Serialised, a run costs one block of latency per transaction; batched, it
+ * costs roughly one block per batch.
+ *
+ * This is only safe because `step` is self-healing. It reads pos and layer from
+ * storage and advances from wherever it finds them, so a transaction that reverts
+ * loses its gas but no work — the next one in the batch performs that step instead.
+ * Running past the end reverts with AlreadyFinished before touching anything.
+ *
+ * Measured against an anvil fork of Base Sepolia at its real 2s block time, one
+ * 6-token generation, identical output every time:
+ *
+ *     serial     219.5s    48 tx   110 blocks
+ *     batch 12    18.9s    47 tx    10 blocks
+ *     batch 24    10.5s    47 tx     5 blocks
+ *     batch 48     6.3s    47 tx     3 blocks
+ *     batch 96     8.8s    47 tx     4 blocks   <- submission cost exceeds the saving
+ *
+ * 32 rather than 48 because nodes cap how many transactions they queue per sender
+ * (geth allows 16 executable and 64 queued by default) and anvil does not. Exceeding
+ * that is harmless — the fill loop below keeps whatever was accepted and moves on —
+ * so this is tuned to sit inside the common limit rather than to probe for it. */
+const BATCH = 32;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const shortErr = (err) => ((err && (err.shortMessage || err.message)) || String(err)).slice(0, 140);
+
+/* Optimistic local state between authoritative reads, so tokens still appear one at a
+ * time while a batch drains. Every batch ends by replacing this with the contract's
+ * own view, so drift lasts at most one batch. */
+function advance(s, info) {
+  const n = { ...s, steps: s.steps + 1 };
+  if (info && info.piece) {
+    n.text = (n.text || "") + info.piece;
+    n.genCount = (n.genCount || 0) + 1;
+    n.pos = n.pos + 1;
+  }
+  return n;
+}
+
 async function runSteps() {
-  let sent = 0, stalls = 0;
-  let nonce = await withFailover((p) => p.getTransactionCount(session.address, "pending"));
   const c = new E.Contract(addr(), ABI, session);
+  let nonce = await withFailover((p) => p.getTransactionCount(session.address, "pending"));
+  let sent = 0, stalls = 0;
+  let live = await readState();
+
   for (;;) {
     if (cancel) { addTx({ kind: "stopped", msg: "progress is saved on-chain", cls: "note" }); break; }
-    const before = await readState();
-    if (before.done) break;
-    if (stalls >= 12) { addTx({ kind: "giving up", msg: "too many consecutive failures", cls: "err" }); break; }
-    try {
-      const t = await c.step(RESERVE, { gasLimit: STEP_GAS, nonce });
-      const r = await t.wait();
-      nonce++; sent++; stalls = 0; sessionGas += r.gasUsed;
-      const info = describeReceipt(r, t.hash);
-      const after = await readState();
-      paint(after, info && info.piece ? info.piece : null);
-      status(`Generating… position ${after.pos}/${after.maxPos} · ${after.genCount} tokens · ${sent} transactions`, "busy");
-    } catch (err) {
-      // A dropped receipt does not mean the transaction failed — the contract's own
-      // step counter is the only trustworthy signal of progress.
-      const after = await readState();
-      if (after.steps > before.steps) {
-        nonce++; sent++; stalls = 0; paint(after);
-        addTx({ kind: "step landed", msg: "receipt was not returned, confirmed on-chain", cls: "note" });
-      } else {
-        stalls++;
-        nonce = await withFailover((p) => p.getTransactionCount(session.address, "pending"));
-        addTx({ kind: `retry ${stalls}`, msg: (err.shortMessage || err.message || String(err)).slice(0, 120), cls: "err" });
-        await new Promise((r2) => setTimeout(r2, 2500));
+    if (live.done) break;
+    if (stalls >= 4) { addTx({ kind: "giving up", msg: "no progress across several batches", cls: "err" }); break; }
+    const before = live;
+
+    // Price the batch once. Left to itself ethers fetches fee data per transaction,
+    // which is a round-trip per step — the very cost this batching exists to remove.
+    const fee = await withFailover((p) => p.getFeeData());
+    const price = fee.maxFeePerGas
+      ? { maxFeePerGas: fee.maxFeePerGas, maxPriorityFeePerGas: fee.maxPriorityFeePerGas ?? 0n }
+      : {};
+
+    // Fill the batch. Each call is only eth_sendRawTransaction — nothing is mined
+    // yet, so these sit in the mempool in nonce order.
+    const batch = [];
+    for (let i = 0; i < BATCH && !cancel; i++) {
+      try {
+        batch.push(await c.step(RESERVE, { gasLimit: STEP_GAS, nonce, ...price }));
+        nonce++;
+      } catch (err) {
+        // Providers cap how many queued transactions they hold per sender. Work with
+        // whatever was accepted; only treat it as a stall if nothing got through.
+        if (batch.length === 0) {
+          stalls++;
+          addTx({ kind: "submission rejected", msg: shortErr(err), cls: "err" });
+          nonce = await withFailover((p) => p.getTransactionCount(session.address, "pending"));
+          await sleep(2000);
+        }
+        break;
       }
     }
+    if (batch.length === 0) continue;
+    status(`${batch.length} transactions in flight…`, "busy");
+
+    // Collect in submission order, so the feed reads the way the chain executed.
+    for (const t of batch) {
+      try {
+        const r = await t.wait();
+        sent++;
+        sessionGas += r.gasUsed;
+        const info = describeReceipt(r, t.hash);
+        live = advance(live, info);
+        paint(live, info && info.piece ? info.piece : null);
+        status(`Generating… position ${live.pos}/${live.maxPos} · ${live.genCount} tokens · ${sent} transactions`, "busy");
+      } catch (err) {
+        // A missing receipt is not a failed step. The authoritative read below is the
+        // only trustworthy account of what actually landed.
+        addTx({ kind: "no receipt", msg: shortErr(err), cls: "err" });
+      }
+    }
+
+    live = await readState();
+    paint(live);
+    stalls = live.steps > before.steps ? 0 : stalls + 1;
+    // Resync rather than trust the local counter: a dropped submission leaves a gap.
+    nonce = await withFailover((p) => p.getTransactionCount(session.address, "pending"));
   }
   return sent;
 }

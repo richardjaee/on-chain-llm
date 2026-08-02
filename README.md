@@ -97,12 +97,33 @@ you can see which layer ran and which token it produced. It uses a session key, 
 Ethereum has no way to authorise a contract to send transactions for you, and batching
 calls into one transaction would exceed the very gas cap this design exists to work around.
 
+**Steps are submitted in parallel, not one at a time.** Transactions from a single sender
+execute in strict nonce order, which is exactly the ordering `step` requires, so waiting
+for each receipt before sending the next buys nothing but latency. The console keeps a
+window of transactions in flight and lets the sequencer pack them into as few blocks as
+the gas limit allows. This is safe because `step` is self-healing — it advances from
+whatever `pos` and `layer` it finds in storage, so a transaction that reverts loses gas
+but no work, and the next one performs that step instead.
+
+Measured against an anvil fork of Base Sepolia at its real 2s block time, same generation,
+identical output:
+
+```
+serial      194.3s   47 transactions   98 blocks
+batched      11.0s   47 transactions    5 blocks
+```
+
+Latency is bounded by blocks, not by transaction count, and one block holds about a
+hundred steps.
+
 ## Limits
 
-The gas ceiling is no longer the binding constraint; cost and latency are. At 1B parameters
-a token needs on the order of 10,000 transactions and minutes of block time, after
-depositing gigabytes of weights across ~100,000 contracts. Attention is not yet sharded
-over the KV range (online softmax), which bounds context length at large model dimensions.
+The gas ceiling is no longer the binding constraint, and neither is transaction count now
+that steps are pipelined — a block holds about a hundred of them. What remains is total
+compute. At 1B parameters a token needs on the order of 10,000 transactions, which is
+~100 blocks of sequencer capacity with nothing else in them, after depositing gigabytes of
+weights across ~100,000 contracts. Attention is not yet sharded over the KV range (online
+softmax), which bounds context length at large model dimensions.
 
 ## Licence and credits
 

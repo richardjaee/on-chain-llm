@@ -15,8 +15,14 @@ contract ResumableTest is Test {
     using stdJson for string;
 
     OnchainLLM internal llm;
+    address internal dirPtr;
+    Transformer.Config internal cfg;
 
     function setUp() public {
+        _deploy(0);
+    }
+
+    function _deploy(uint256 macs) internal {
         string memory root = vm.projectRoot();
         bytes memory blob = vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/model.hex"))));
 
@@ -53,7 +59,9 @@ contract ResumableTest is Test {
             shared: true,
             invSqrtHs: 0
         });
-        llm = new OnchainLLM(WeightStore.write(dir), c);
+        dirPtr = WeightStore.write(dir);
+        cfg = c;
+        llm = new OnchainLLM(dirPtr, c, macs);
     }
 
     function test_ResumableMatchesSpec() public {
@@ -82,5 +90,36 @@ contract ResumableTest is Test {
         console2.log("tokens matching spec:", want.length);
         console2.log("transactions:", llm.steps());
         console2.log("decoded text:", llm.text());
+    }
+
+    /// @notice Sharding a matmul by output row must not change its result. With the
+    ///         default budget this model never actually shards — every tensor fits in
+    ///         one phase — so the split path would otherwise go untested until a model
+    ///         large enough to need it. A deliberately tiny budget forces ten-row
+    ///         chunks of a 64-wide tensor and four-row chunks of a 172-wide one.
+    function test_RowShardingMatchesUnsharded() public {
+        string memory spec = vm.readFile(string.concat(vm.projectRoot(), "/artifacts/generation_vectors.json"));
+        uint256[] memory promptRaw = spec.readUintArray(".prompt");
+        uint256[] memory want = spec.readUintArray(".gen");
+        uint16[] memory prompt = new uint16[](promptRaw.length);
+        for (uint256 i = 0; i < promptRaw.length; ++i) {
+            prompt[i] = uint16(promptRaw[i]);
+        }
+
+        _deploy(700);
+        llm.start(prompt, want.length);
+        uint256 guard;
+        while (!llm.finished()) {
+            llm.step(400_000);
+            guard++;
+            require(guard < 4000, "step budget exceeded");
+        }
+
+        uint16[] memory got = llm.generatedIds();
+        assertEq(got.length, want.length, "token count differs when sharded");
+        for (uint256 i = 0; i < want.length; ++i) {
+            assertEq(uint256(got[i]), want[i], "row sharding changed the output");
+        }
+        console2.log("sharded transactions:", llm.steps());
     }
 }

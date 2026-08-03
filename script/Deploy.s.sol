@@ -44,7 +44,8 @@ contract DeployScript is Script {
                 kvd: 32,
                 shared: true,
                 invSqrtHs: 0
-            })
+            }),
+            0 // default MACs per sharded matmul phase
         );
 
         vm.stopBroadcast();

@@ -33,6 +33,12 @@ contract OnchainLLM {
     uint32 private immutable _seqLen;
     bool private immutable _shared;
 
+    /// @notice Multiply-accumulates a sharded matmul phase aims for. Lower means more,
+    ///         smaller transactions — the right value depends on the chain's per
+    ///         transaction gas ceiling, so it is set at deployment rather than compiled
+    ///         in. Zero takes the library default.
+    uint256 public immutable macsPerPhase;
+
     // --------------------------------------------------------------- session
     uint16[] public promptIds;
     uint16[] public generated;
@@ -42,10 +48,12 @@ contract OnchainLLM {
     bool public finished;
     uint256 public steps;
 
-    /// @notice Which phase of the current layer runs next: 0 PREPARE, 1 ATTEND, 2 PROJECT
+    /// @notice Which phase of the current layer runs next.
+    ///         0 PREPARE, 1 ATTEND, 2 W_o, 3 SwiGLU, 4 W_2
     uint256 public phase;
-    /// @notice Next attention head to run, while `phase` is ATTEND
-    uint256 public head;
+    /// @notice Position within the current phase: the next head for ATTEND, the next
+    ///         output row for the three matmul phases.
+    uint256 public cursor;
 
     /// @dev Residual stream carried between layer steps (Q32)
     int256[] private _x;
@@ -63,6 +71,8 @@ contract OnchainLLM {
     ///      they pack four to a slot as int64 lanes exactly like the KV cache.
     mapping(uint256 => uint256) private _scratch;
     uint256 private constant SCRATCH_AO = 1 << 128;
+    uint256 private constant SCRATCH_NORM = 2 << 128;
+    uint256 private constant SCRATCH_GATE = 3 << 128;
 
     /// @dev An ATTEND phase covers the query heads that share one KV head (nHeads/nKv
     ///      under grouped-query attention). Splitting finer would make two phases read
@@ -78,8 +88,9 @@ contract OnchainLLM {
     error PromptTooLong();
     error KvOverflow(int256 value);
 
-    constructor(address directory_, Transformer.Config memory c) {
+    constructor(address directory_, Transformer.Config memory c, uint256 macsPerPhase_) {
         directory = directory_;
+        macsPerPhase = macsPerPhase_ == 0 ? Transformer.MACS_PER_PHASE : macsPerPhase_;
         _dim = c.dim;
         _hidden = c.hidden;
         _nLayers = c.nLayers;
@@ -120,7 +131,7 @@ contract OnchainLLM {
         pos = 0;
         layer = 0;
         phase = 0;
-        head = 0;
+        cursor = 0;
         finished = false;
         steps = 0;
         _x = new int256[](c.dim);
@@ -169,7 +180,7 @@ contract OnchainLLM {
             return;
         }
 
-        if (lo == 0 && phase == 0 && head == 0) {
+        if (lo == 0 && phase == 0 && cursor == 0) {
             uint256 tok0 = p < promptIds.length ? promptIds[p] : generated[p - promptIds.length];
             (bytes memory ew, Transformer.Layout memory eo) = Transformer.sliceEmbed(chunks, o, c, tok0);
             Transformer.embed(ew, eo, c, b, 0, 1);
@@ -230,8 +241,12 @@ contract OnchainLLM {
             _phaseAttend(chunks, o, c, b, p);
             return false;
         }
-        _phaseProject(chunks, o, c, b);
-        return true;
+        if (ph == 2) return _phaseWo(chunks, o, c, b);
+        if (ph == 3) {
+            _phaseFfn1(chunks, o, c, b);
+            return false;
+        }
+        return _phaseFfn2(chunks, o, c, b);
     }
 
     /// @dev PREPARE. The slice holds exactly this layer's rows and this position's RoPE
@@ -251,7 +266,7 @@ contract OnchainLLM {
         _storeKvRow(c, b, l, p);
         _saveVec(0, b.query, 0, c.dim);
         phase = 1;
-        head = 0;
+        cursor = 0;
     }
 
     /// @dev ATTEND. Needs no weights at all — only the query and the KV cache — which is
@@ -266,7 +281,7 @@ contract OnchainLLM {
         chunks;
         o;
         uint256 l = layer;
-        uint256 h0 = head;
+        uint256 h0 = cursor;
         uint256 h1 = h0 + c.nHeads / c.nKv;
         if (h1 > c.nHeads) h1 = c.nHeads;
         _loadVec(0, b.query, 0, c.dim);
@@ -276,24 +291,89 @@ contract OnchainLLM {
         _loadKvHeads(c, b, l, p, h0, h1);
         Transformer.attend(c, b, l, p, h0, h1);
         _saveVec(SCRATCH_AO, b.attnOut, h0 * c.hs, (h1 - h0) * c.hs);
-        head = h1;
-        if (h1 == c.nHeads) phase = 2;
+        cursor = h1;
+        if (h1 == c.nHeads) {
+            phase = 2;
+            cursor = 0;
+        }
     }
 
-    /// @dev PROJECT: output projection, residual, and the feed-forward network
-    function _phaseProject(
+    /// @dev W_o shard. Output rows are independent, so a row range needs no partial
+    ///      sums carried across the boundary — each row lands in the residual stream
+    ///      and is finished with. When the last row is done the residual is complete,
+    ///      so the FFN's RMSNorm is taken here and checkpointed for the shards ahead.
+    function _phaseWo(
+        address[] memory chunks,
+        Transformer.Layout memory o,
+        Transformer.Config memory c,
+        Transformer.Buffers memory b
+    ) private returns (bool) {
+        uint256 l = layer;
+        uint256 r0 = cursor;
+        uint256 n = _packAligned(Transformer.rowsPerPhase(macsPerPhase, c.dim, c.dim - r0), c.dim - r0);
+        _loadVec(SCRATCH_AO, b.attnOut, 0, c.dim);
+        (bytes memory w, Transformer.Layout memory s) = Transformer.sliceWo(chunks, o, c, l, r0, n);
+        Transformer.projectWo(w, s, c, b, r0, n);
+        for (uint256 i = r0; i < r0 + n; ++i) {
+            b.resid[i] += b.proj[i];
+        }
+        cursor = r0 + n;
+        if (cursor == c.dim) {
+            (bytes memory rw, Transformer.Layout memory ro) = Transformer.sliceRmsFfn(chunks, o, c, l);
+            Transformer.rmsnorm(rw, ro.rmsFfn, 0, b.resid, b.normed, c.dim);
+            _saveVec(SCRATCH_NORM, b.normed, 0, c.dim);
+            phase = 3;
+            cursor = 0;
+        }
+        return true;
+    }
+
+    /// @dev SwiGLU shard: W_1 and W_3 rows, combined and stored as `gate`
+    function _phaseFfn1(
         address[] memory chunks,
         Transformer.Layout memory o,
         Transformer.Config memory c,
         Transformer.Buffers memory b
     ) private {
         uint256 l = layer;
-        _loadVec(SCRATCH_AO, b.attnOut, 0, c.dim);
-        (bytes memory w, Transformer.Layout memory s) = Transformer.sliceProject(chunks, o, c, l);
-        Transformer.project(w, s, Transformer.sliced(c), b, 0);
-        phase = 0;
-        head = 0;
-        layer = l + 1;
+        uint256 r0 = cursor;
+        uint256 n = _packAligned(Transformer.rowsPerPhase(macsPerPhase, c.dim, c.hidden - r0), c.hidden - r0);
+        _loadVec(SCRATCH_NORM, b.normed, 0, c.dim);
+        (bytes memory w, Transformer.Layout memory s) = Transformer.sliceFfn1(chunks, o, c, l, r0, n);
+        Transformer.projectFfn1(w, s, c, b, r0, n);
+        _saveVec(SCRATCH_GATE, b.gate, r0, n);
+        cursor = r0 + n;
+        if (cursor == c.hidden) {
+            phase = 4;
+            cursor = 0;
+        }
+    }
+
+    /// @dev W_2 shard, back into the residual stream. Row i of W_2 reads the whole of
+    ///      `gate`, so every shard loads all of it — the one place this decomposition
+    ///      pays an O(hidden) read per phase rather than a slice.
+    function _phaseFfn2(
+        address[] memory chunks,
+        Transformer.Layout memory o,
+        Transformer.Config memory c,
+        Transformer.Buffers memory b
+    ) private returns (bool) {
+        uint256 l = layer;
+        uint256 r0 = cursor;
+        uint256 n = _packAligned(Transformer.rowsPerPhase(macsPerPhase, c.hidden, c.dim - r0), c.dim - r0);
+        _loadVec(SCRATCH_GATE, b.gate, 0, c.hidden);
+        (bytes memory w, Transformer.Layout memory s) = Transformer.sliceFfn2(chunks, o, c, l, r0, n);
+        Transformer.projectFfn2(w, s, c, b, r0, n);
+        for (uint256 i = r0; i < r0 + n; ++i) {
+            b.resid[i] += b.proj[i];
+        }
+        cursor = r0 + n;
+        if (cursor == c.dim) {
+            phase = 0;
+            cursor = 0;
+            layer = l + 1;
+        }
+        return true;
     }
 
     /// @dev Save `len` values of `src` from `off`, packed four int64 lanes per slot.
@@ -301,17 +381,29 @@ contract OnchainLLM {
     ///      are `hs` wide, and `hs` is a multiple of four).
     function _saveVec(uint256 space, int256[] memory src, uint256 off, uint256 len) private {
         for (uint256 i = 0; i < len; i += PACK_N) {
-            _scratch[space + (off + i) / PACK_N] = _pack(src, off + i, PACK_N);
+            uint256 n = len - i < PACK_N ? len - i : PACK_N;
+            _scratch[space + (off + i) / PACK_N] = _pack(src, off + i, n);
         }
     }
 
     function _loadVec(uint256 space, int256[] memory dst, uint256 off, uint256 len) private view {
         for (uint256 i = 0; i < len; i += PACK_N) {
             uint256 packed = _scratch[space + (off + i) / PACK_N];
-            for (uint256 j = 0; j < PACK_N; ++j) {
+            uint256 n = len - i < PACK_N ? len - i : PACK_N;
+            for (uint256 j = 0; j < n; ++j) {
                 dst[off + i + j] = _lane(packed, j);
             }
         }
+    }
+
+    /// @dev Round a row chunk down to a whole number of packed slots so two chunks can
+    ///      never land in the same one; the final chunk takes whatever remains, and its
+    ///      slots are exclusively its own because every chunk before it was aligned.
+    function _packAligned(uint256 n, uint256 left) private pure returns (uint256) {
+        if (n >= left) return left;
+        uint256 a = (n / PACK_N) * PACK_N;
+        if (a == 0) a = PACK_N < left ? PACK_N : left;
+        return a;
     }
 
     /// @dev Pick the next token (or teacher-force from the prompt) and advance

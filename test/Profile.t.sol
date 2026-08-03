@@ -49,7 +49,7 @@ contract ProfileTest is Test {
             shared: true,
             invSqrtHs: 0
         });
-        llm = new OnchainLLM(WeightStore.write(dir), cfg);
+        llm = new OnchainLLM(WeightStore.write(dir), cfg, 0);
     }
 
     function test_Profile() public {

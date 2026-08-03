@@ -513,6 +513,112 @@ library Transformer {
         }
     }
 
+    /* ---------------------------- row-sharded PROJECT -------------------------
+     *
+     * Output rows of a matmul are independent: row i reads all of x and writes one
+     * value, touching nothing else. So a matmul splits across transactions exactly,
+     * with no partial sums to carry — the only state that crosses a boundary is the
+     * vector being filled in.
+     *
+     * This is what decides whether a model is merely slow or actually impossible.
+     * At 1.1B parameters a single FFN matmul is ~11.5M multiply-accumulates, which
+     * is two orders of magnitude past any per-transaction budget; sharded by row it
+     * is however many transactions it needs to be. */
+
+    /// @notice Multiply-accumulates one sharded matmul phase aims for.
+    /// @dev Rows per phase is derived from this and the tensor's width rather than
+    ///      fixed, so a wide tensor takes fewer rows per transaction and the cost of
+    ///      a phase stays roughly flat no matter the shape. ~150k MACs is ~7.3M gas
+    ///      at the measured ~49 gas per MAC, leaving room under a 14M ceiling for the
+    ///      slice read and the checkpoint around it.
+    uint256 internal constant MACS_PER_PHASE = 150_000;
+
+    /// @notice Rows of a `cols`-wide tensor to process in one phase
+    function rowsPerPhase(uint256 macs, uint256 cols, uint256 rowsLeft) internal pure returns (uint256 n) {
+        n = macs / cols;
+        if (n == 0) n = 1;
+        if (n > rowsLeft) n = rowsLeft;
+    }
+
+    /// @notice W_o rows [r0, r0+n) of a slice, into proj at the same indices
+    function projectWo(bytes memory w, Layout memory s, Config memory c, Buffers memory b, uint256 r0, uint256 n)
+        internal
+        pure
+    {
+        matmul(w, s.wo, n, 0, n, c.dim, b.attnOut, b.proj, r0);
+    }
+
+    /// @notice W_1 and W_3 rows [r0, r0+n), combined through SwiGLU into gate
+    /// @dev Both tensors produce the same output index, and the activation is
+    ///      elementwise, so a row range of each is everything this range of `gate`
+    ///      needs — `up` never has to exist beyond the phase that creates it.
+    function projectFfn1(bytes memory w, Layout memory s, Config memory c, Buffers memory b, uint256 r0, uint256 n)
+        internal
+        pure
+    {
+        matmul(w, s.w1, n, 0, n, c.dim, b.normed, b.gate, r0);
+        matmul(w, s.w3, n, 0, n, c.dim, b.normed, b.up, r0);
+        for (uint256 i = r0; i < r0 + n; ++i) {
+            b.gate[i] = (FixedPoint.silu(b.gate[i]) * b.up[i]) >> FixedPoint.F;
+        }
+    }
+
+    /// @notice W_2 rows [r0, r0+n) of a slice, into proj at the same indices
+    function projectFfn2(bytes memory w, Layout memory s, Config memory c, Buffers memory b, uint256 r0, uint256 n)
+        internal
+        pure
+    {
+        matmul(w, s.w2, n, 0, n, c.hidden, b.gate, b.proj, r0);
+    }
+
+    /// @notice Weights for a W_o shard: rows [r0, r0+n)
+    function sliceWo(address[] memory chunks, Layout memory o, Config memory c, uint256 l, uint256 r0, uint256 n)
+        internal
+        view
+        returns (bytes memory data, Layout memory s)
+    {
+        data = new bytes(blockSize(n, c.dim) + SLICE_PAD);
+        s.wo = 0;
+        _sliceRows(chunks, data, 0, o.wo, uint256(c.nLayers) * c.dim, l * c.dim + r0, n, c.dim);
+    }
+
+    /// @notice Weights for a SwiGLU shard: W_1 and W_3 rows [r0, r0+n), plus rms_ffn
+    function sliceFfn1(address[] memory chunks, Layout memory o, Config memory c, uint256 l, uint256 r0, uint256 n)
+        internal
+        view
+        returns (bytes memory data, Layout memory s)
+    {
+        uint256 one = blockSize(n, c.dim);
+        data = new bytes(one * 2 + SLICE_PAD);
+        s.w1 = 0;
+        _sliceRows(chunks, data, 0, o.w1, uint256(c.nLayers) * c.hidden, l * c.hidden + r0, n, c.dim);
+        s.w3 = one;
+        _sliceRows(chunks, data, one, o.w3, uint256(c.nLayers) * c.hidden, l * c.hidden + r0, n, c.dim);
+    }
+
+    /// @notice Weights for a W_2 shard: rows [r0, r0+n)
+    function sliceFfn2(address[] memory chunks, Layout memory o, Config memory c, uint256 l, uint256 r0, uint256 n)
+        internal
+        view
+        returns (bytes memory data, Layout memory s)
+    {
+        data = new bytes(blockSize(n, c.hidden) + SLICE_PAD);
+        s.w2 = 0;
+        _sliceRows(chunks, data, 0, o.w2, uint256(c.nLayers) * c.dim, l * c.dim + r0, n, c.hidden);
+    }
+
+    /// @notice The rms_ffn gains for one layer, as a single-row block
+    function sliceRmsFfn(address[] memory chunks, Layout memory o, Config memory c, uint256 l)
+        internal
+        view
+        returns (bytes memory data, Layout memory s)
+    {
+        data = new bytes(1 + c.dim * 2 + SLICE_PAD);
+        s.rmsFfn = 0;
+        WeightStore.readRangeAt(chunks, o.rmsFfn, 1, data, 0);
+        WeightStore.readRangeAt(chunks, o.rmsFfn + 1 + l * c.dim * 2, c.dim * 2, data, 1);
+    }
+
     /// @notice PROJECT: output projection, residual, and the feed-forward network
     function project(bytes memory w, Layout memory o, Config memory c, Buffers memory b, uint256 l) internal pure {
         uint256 dim = c.dim;

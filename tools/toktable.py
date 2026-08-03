@@ -12,6 +12,7 @@ Two sources:
                                      [f32 score][i32 len][bytes]
     --jsspec frontend/_tok_inline.js the tok512 table embedded in the console, whose
                                      entries are [score, hex] in id order
+    --hf tokenizer.json             a HuggingFace byte-level BPE vocabulary
 
     python3 tools/toktable.py --tokenizer tokenizer.bin --out artifacts/tokens15m.hex
 """
@@ -28,6 +29,38 @@ def from_tokenizer_bin(path):
         off += 4
         toks.append(d[off:off + ln])
         off += ln
+    return toks
+
+
+def from_hf_tokenizer(path):
+    """A HuggingFace tokenizer.json using GPT-2 byte-level BPE.
+
+    Those vocabularies do not store the bytes a token stands for; they store each byte
+    remapped to a printable character, so a leading space is '\u0120' rather than ' '.
+    The mapping is inverted here, at build time, so the table on chain holds the actual
+    bytes and `Decoder.sol` needs to know nothing about the convention. Doing it the
+    other way — teaching the contract the 256-entry mapping — would cost storage and gas
+    on every decode to represent something already known off chain.
+    """
+    tj = json.load(open(path))
+    vocab = tj["model"]["vocab"]
+    # the GPT-2 byte<->unicode table
+    bs = list(range(33, 127)) + list(range(161, 173)) + list(range(174, 256))
+    cs, n = bs[:], 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    u2b = {chr(c): b for b, c in zip(bs, cs)}
+
+    toks = [b""] * len(vocab)
+    for tok, i in vocab.items():
+        try:
+            toks[i] = bytes(u2b[ch] for ch in tok)
+        except KeyError:
+            # added/control tokens such as <|im_start|> are literal, not byte-mapped
+            toks[i] = tok.encode("utf-8")
     return toks
 
 
@@ -63,11 +96,17 @@ def main():
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--tokenizer", help="llama2.c tokenizer.bin")
     src.add_argument("--jsspec", help="frontend/_tok_inline.js, for tok512")
+    src.add_argument("--hf", help="HuggingFace tokenizer.json (GPT-2 byte-level BPE)")
     p.add_argument("--out", required=True)
     p.add_argument("--limit", type=int, help="truncate to this many tokens")
     a = p.parse_args()
 
-    toks = from_tokenizer_bin(a.tokenizer) if a.tokenizer else from_js_spec(a.jsspec)
+    if a.tokenizer:
+        toks = from_tokenizer_bin(a.tokenizer)
+    elif a.hf:
+        toks = from_hf_tokenizer(a.hf)
+    else:
+        toks = from_js_spec(a.jsspec)
     if a.limit:
         toks = toks[:a.limit]
     table = build(toks)

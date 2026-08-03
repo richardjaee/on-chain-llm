@@ -128,8 +128,25 @@ The gas ceiling is no longer the binding constraint, and neither is transaction 
 that steps are pipelined — a block holds about a hundred of them. What remains is total
 compute. At 1B parameters a token needs on the order of 10,000 transactions, which is
 ~100 blocks of sequencer capacity with nothing else in them, after depositing gigabytes of
-weights across ~100,000 contracts. Attention is not yet sharded over the KV range (online
-softmax), which bounds context length at large model dimensions.
+weights across ~100,000 contracts.
+
+**Context length** is bounded by whichever phase stops fitting in one transaction. A layer
+splits into PREPARE / ATTEND / PROJECT, and only ATTEND grows with position — it divides
+by head, so the reachable position is set by one KV head's share of the cache rather than
+by a whole layer. Measured at 14M gas per transaction, that moved the wall from position
+48 to **167**; `test_FindStrandPosition` pins it.
+
+Note that the usual answer here — FlashAttention-style online softmax — is the wrong tool.
+Its rescaling exists to make attention single-pass, which is unnecessary when state is
+already checkpointed between transactions, and the rescaling multiplications would break
+bit-exactness against the specification. Heads are independent and the KV range accumulates
+by integer addition, so both split *exactly*, with no rescaling at all.
+
+What binds past 167 is the weight read: every transaction materialises the whole 540KB
+blob (~780k gas, and ~556k of that is quadratic memory expansion). Reading only the slice
+a phase touches costs ~233k, which would free over 1M of headroom per transaction. That
+matters far more for larger models, where the blob grows but the slice a phase needs
+does not.
 
 ## Licence and credits
 

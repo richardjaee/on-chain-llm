@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {FixedPoint} from "./FixedPoint.sol";
+import {WeightStore} from "./WeightStore.sol";
 
 /// @title Transformer
 /// @notice Integer-only Llama-2 forward pass: RMSNorm, RoPE, grouped-query attention,
@@ -278,10 +279,15 @@ library Transformer {
         b.cacheLayers = cacheLayers;
     }
 
-    /// @dev Load the token embedding row and scale it up into the Q32 residual stream
-    function embed(bytes memory w, Layout memory o, Config memory c, Buffers memory b, uint256 token) internal pure {
+    /// @dev Load the token embedding row and scale it up into the Q32 residual stream.
+    ///      `rows` is the number of rows in the block holding it — the full vocabulary
+    ///      for the whole blob, or 1 for a single-row slice.
+    function embed(bytes memory w, Layout memory o, Config memory c, Buffers memory b, uint256 token, uint256 rows)
+        internal
+        pure
+    {
         uint256 shift = _u8(w, o.tokEmb + token);
-        uint256 vals = o.tokEmb + c.vocab + token * uint256(c.dim) * 2;
+        uint256 vals = o.tokEmb + rows + token * uint256(c.dim) * 2;
         uint256 up = FixedPoint.F - shift;
         for (uint256 i = 0; i < c.dim; ++i) {
             b.resid[i] = _i16(w, vals + i * 2) << up;
@@ -330,6 +336,150 @@ library Transformer {
      * Heads never interact: each reads its own query slice and its own KV head, and
      * writes its own slice of attnOut. Splitting them is a reordering of independent
      * work, not an approximation, so it cannot change a single bit of the result. */
+
+    /* ------------------------------ weight slices -----------------------------
+     *
+     * A phase touches a small, known part of the blob: PREPARE needs one layer's
+     * Q/K/V and one position's RoPE row, PROJECT needs one layer's W_o and FFN,
+     * and ATTEND needs no weights at all. Materialising all 540KB for any of them
+     * costs ~780k gas, most of it quadratic memory expansion, on every transaction.
+     *
+     * A slice holds the same [shifts][values] structure as the blob, but with only
+     * the rows the phase reads. Crucially the phase functions are then called with
+     * a Config whose nLayers is 1 and a layer index of 0, which makes every offset
+     * they compute land correctly inside the slice — so the sliced and whole-blob
+     * paths run the *same code*, and cannot drift apart numerically. */
+
+    /// @dev Copy rows [r0, r0+n) of a tensor block into `dest` at `at`, preserving the
+    ///      [shifts][values] layout. Returns bytes written.
+    function _sliceRows(
+        address[] memory chunks,
+        bytes memory dest,
+        uint256 at,
+        uint256 base,
+        uint256 rowsTotal,
+        uint256 r0,
+        uint256 n,
+        uint256 cols
+    ) private view returns (uint256) {
+        WeightStore.readRangeAt(chunks, base + r0, n, dest, at);
+        WeightStore.readRangeAt(chunks, base + rowsTotal + r0 * cols * 2, n * cols * 2, dest, at + n);
+        return n + n * cols * 2;
+    }
+
+    /// @dev Buffers are padded so a trailing `mload` of a partial row cannot read past
+    ///      the allocation; matmul ignores the lanes beyond `cols`.
+    uint256 private constant SLICE_PAD = 32;
+
+    /// @notice Weights for one PREPARE: rms_att, W_q/W_k/W_v for layer `l`, RoPE at `pos`
+    function slicePrepare(address[] memory chunks, Layout memory o, Config memory c, uint256 l, uint256 pos)
+        internal
+        view
+        returns (bytes memory data, Layout memory s)
+    {
+        uint256 dim = c.dim;
+        uint256 half = c.hs / 2;
+        uint256 n = 1 + dim * 2 // rms_att: one shift, this layer's gains
+            + blockSize(dim, dim) // W_q rows
+            + blockSize(c.kvd, dim) * 2 // W_k, W_v rows
+            + half * 4 * 2; // one RoPE row, cos and sin
+        data = new bytes(n + SLICE_PAD);
+        uint256 at = 0;
+
+        // rms_att is a single-row block: shift byte, then this layer's slice of gains
+        WeightStore.readRangeAt(chunks, o.rmsAtt, 1, data, at);
+        WeightStore.readRangeAt(chunks, o.rmsAtt + 1 + l * dim * 2, dim * 2, data, at + 1);
+        s.rmsAtt = at;
+        at += 1 + dim * 2;
+
+        s.wq = at;
+        at += _sliceRows(chunks, data, at, o.wq, uint256(c.nLayers) * dim, l * dim, dim, dim);
+        s.wk = at;
+        at += _sliceRows(chunks, data, at, o.wk, uint256(c.nLayers) * c.kvd, l * c.kvd, c.kvd, dim);
+        s.wv = at;
+        at += _sliceRows(chunks, data, at, o.wv, uint256(c.nLayers) * c.kvd, l * c.kvd, c.kvd, dim);
+
+        // Only this position's RoPE row, so the caller passes pos = 0
+        s.ropeCos = at;
+        WeightStore.readRangeAt(chunks, o.ropeCos + pos * half * 4, half * 4, data, at);
+        at += half * 4;
+        s.ropeSin = at;
+        WeightStore.readRangeAt(chunks, o.ropeSin + pos * half * 4, half * 4, data, at);
+    }
+
+    /// @notice Weights for one PROJECT: W_o, rms_ffn, and W_1/W_2/W_3 for layer `l`
+    function sliceProject(address[] memory chunks, Layout memory o, Config memory c, uint256 l)
+        internal
+        view
+        returns (bytes memory data, Layout memory s)
+    {
+        uint256 dim = c.dim;
+        uint256 hid = c.hidden;
+        uint256 n = blockSize(dim, dim) + 1 + dim * 2 + blockSize(hid, dim) * 2 + blockSize(dim, hid);
+        data = new bytes(n + SLICE_PAD);
+        uint256 at = 0;
+
+        s.wo = at;
+        at += _sliceRows(chunks, data, at, o.wo, uint256(c.nLayers) * dim, l * dim, dim, dim);
+
+        WeightStore.readRangeAt(chunks, o.rmsFfn, 1, data, at);
+        WeightStore.readRangeAt(chunks, o.rmsFfn + 1 + l * dim * 2, dim * 2, data, at + 1);
+        s.rmsFfn = at;
+        at += 1 + dim * 2;
+
+        s.w1 = at;
+        at += _sliceRows(chunks, data, at, o.w1, uint256(c.nLayers) * hid, l * hid, hid, dim);
+        s.w2 = at;
+        at += _sliceRows(chunks, data, at, o.w2, uint256(c.nLayers) * dim, l * dim, dim, hid);
+        s.w3 = at;
+        at += _sliceRows(chunks, data, at, o.w3, uint256(c.nLayers) * hid, l * hid, hid, dim);
+    }
+
+    /// @notice Weights for the classifier: final RMSNorm gains and the whole W_cls
+    function sliceClassify(address[] memory chunks, Layout memory o, Config memory c)
+        internal
+        view
+        returns (bytes memory data, Layout memory s)
+    {
+        uint256 n = 1 + c.dim * 2 + blockSize(c.vocab, c.dim);
+        data = new bytes(n + SLICE_PAD);
+        s.rmsFinal = 0;
+        WeightStore.readRangeAt(chunks, o.rmsFinal, 1 + c.dim * 2, data, 0);
+        s.wcls = 1 + c.dim * 2;
+        _sliceRows(chunks, data, s.wcls, o.wcls, c.vocab, 0, c.vocab, c.dim);
+    }
+
+    /// @notice The single token-embedding row for `token`
+    function sliceEmbed(address[] memory chunks, Layout memory o, Config memory c, uint256 token)
+        internal
+        view
+        returns (bytes memory data, Layout memory s)
+    {
+        data = new bytes(1 + c.dim * 2 + SLICE_PAD);
+        s.tokEmb = 0;
+        _sliceRows(chunks, data, 0, o.tokEmb, c.vocab, token, 1, c.dim);
+    }
+
+    /// @notice A Config addressing a one-layer slice: same arithmetic, local offsets
+    /// @dev Every field is restated rather than assigning `d = c` and overwriting one.
+    ///      Memory structs assign by reference in Solidity, so that shorter form would
+    ///      set the *caller's* nLayers to 1 and every later slice would be cut from a
+    ///      blob one fifth the real size.
+    function sliced(Config memory c) internal pure returns (Config memory d) {
+        d = Config({
+            dim: c.dim,
+            hidden: c.hidden,
+            nLayers: 1,
+            nHeads: c.nHeads,
+            nKv: c.nKv,
+            vocab: c.vocab,
+            seqLen: c.seqLen,
+            hs: c.hs,
+            kvd: c.kvd,
+            shared: c.shared,
+            invSqrtHs: c.invSqrtHs
+        });
+    }
 
     /// @notice PREPARE: everything a layer does before attention
     function prepare(bytes memory w, Layout memory o, Config memory c, Buffers memory b, uint256 pos, uint256 l)
@@ -395,7 +545,7 @@ library Transformer {
         uint256 lo,
         uint256 hi
     ) internal pure {
-        if (lo == 0) embed(w, o, c, b, token);
+        if (lo == 0) embed(w, o, c, b, token, c.vocab);
         for (uint256 l = lo; l < hi; ++l) {
             prepare(w, o, c, b, pos, l);
             cacheKv(c, b, l, pos);

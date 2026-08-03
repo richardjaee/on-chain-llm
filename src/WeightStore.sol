@@ -68,22 +68,35 @@ library WeightStore {
     ///      MAX_PAYLOAD except the last. A range may straddle chunks, so this walks
     ///      them and issues one EXTCODECOPY per overlap.
     function readRange(address[] memory chunks, uint256 offset, uint256 len, bytes memory dest) internal view {
-        if (len > dest.length) revert OutOfRange();
-        uint256 done = 0;
-        while (done < len) {
-            uint256 pos = offset + done;
-            uint256 ci = pos / MAX_PAYLOAD;
+        readRangeAt(chunks, offset, len, dest, 0);
+    }
+
+    /// @notice As `readRange`, but writing into `dest` starting at `destOff`
+    /// @dev Assembling a slice means copying several disjoint ranges of the logical blob
+    ///      into one buffer, so the destination cursor has to move independently of the
+    ///      source offset.
+    function readRangeAt(address[] memory chunks, uint256 offset, uint256 len, bytes memory dest, uint256 destOff)
+        internal
+        view
+    {
+        if (destOff + len > dest.length) revert OutOfRange();
+        // Advance the parameters rather than tracking separate cursors: this loop is
+        // inlined into every slice builder, and each extra live local pushes the
+        // surrounding phase function past the EVM's reachable stack depth.
+        while (len > 0) {
+            uint256 ci = offset / MAX_PAYLOAD;
             if (ci >= chunks.length) revert OutOfRange();
-            uint256 within = pos % MAX_PAYLOAD;
+            uint256 within = offset % MAX_PAYLOAD;
             uint256 take = MAX_PAYLOAD - within;
-            uint256 left = len - done;
-            if (take > left) take = left;
+            if (take > len) take = len;
             address chunk = chunks[ci];
             assembly ("memory-safe") {
-                extcodecopy(chunk, add(add(dest, 0x20), done), add(1, within), take)
+                extcodecopy(chunk, add(add(dest, 0x20), destOff), add(1, within), take)
             }
             unchecked {
-                done += take;
+                offset += take;
+                destOff += take;
+                len -= take;
             }
         }
     }

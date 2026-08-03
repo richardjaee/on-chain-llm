@@ -141,7 +141,6 @@ contract OnchainLLM {
         Transformer.Layout memory o = Transformer.layout(c);
         (address tokPtr, address[] memory chunks) = _dir();
         tokPtr;
-        bytes memory w = _weights(chunks, o, c);
 
         uint256 p = pos;
         uint256 lo = layer;
@@ -161,8 +160,9 @@ contract OnchainLLM {
             // where the next token is teacher-forced and the logits are discarded
             steps += 1;
             if (p + 1 >= promptIds.length) {
-                Transformer.normFinal(w, o, c, b);
-                Transformer.classifyRange(w, o, c, b, 0, c.vocab);
+                (bytes memory cw, Transformer.Layout memory co) = Transformer.sliceClassify(chunks, o, c);
+                Transformer.normFinal(cw, co, c, b);
+                Transformer.classifyRange(cw, co, c, b, 0, c.vocab);
             }
             emit StepRun(p, lo, steps);
             _emit(b, p, p + 1 < promptIds.length);
@@ -171,7 +171,8 @@ contract OnchainLLM {
 
         if (lo == 0 && phase == 0 && head == 0) {
             uint256 tok0 = p < promptIds.length ? promptIds[p] : generated[p - promptIds.length];
-            Transformer.embed(w, o, c, b, tok0);
+            (bytes memory ew, Transformer.Layout memory eo) = Transformer.sliceEmbed(chunks, o, c, tok0);
+            Transformer.embed(ew, eo, c, b, 0, 1);
         }
 
         // Guard on the most expensive phase seen so far, not the last one. Phases
@@ -189,7 +190,7 @@ contract OnchainLLM {
         while (layer < c.nLayers) {
             uint256 before = gasleft();
             if (ran > 0 && before < worst + worst / 3 + reserve) break;
-            if (_phase(w, o, c, b, p)) residDirty = true;
+            if (_phase(chunks, o, c, b, p)) residDirty = true;
             uint256 cost = before - gasleft();
             if (cost > worst) worst = cost;
             unchecked {
@@ -210,48 +211,89 @@ contract OnchainLLM {
     }
 
     /// @dev Run one phase of the current layer and advance the cursors.
-    ///      Returns true if the residual stream changed.
+    ///      Returns true if the residual stream changed. Split into one function per
+    ///      phase because each needs its own weight slice, and holding all three sets
+    ///      of locals in a single frame runs the compiler out of stack.
     function _phase(
-        bytes memory w,
+        address[] memory chunks,
         Transformer.Layout memory o,
         Transformer.Config memory c,
         Transformer.Buffers memory b,
         uint256 p
     ) private returns (bool residChanged) {
-        uint256 l = layer;
         uint256 ph = phase;
-
         if (ph == 0) {
-            Transformer.prepare(w, o, c, b, p, l);
-            _storeKvRow(c, b, l, p);
-            _saveVec(0, b.query, 0, c.dim);
-            phase = 1;
-            head = 0;
+            _phasePrepare(chunks, o, c, b, p);
             return false;
         }
-
         if (ph == 1) {
-            uint256 h0 = head;
-            uint256 h1 = h0 + c.nHeads / c.nKv;
-            if (h1 > c.nHeads) h1 = c.nHeads;
-            _loadVec(0, b.query, 0, c.dim);
-            // Only this head range's slice of the KV cache is touched, so only that
-            // slice is read back — the saving grows with position and is what keeps
-            // an ATTEND phase affordable deep into a sequence.
-            _loadKvHeads(c, b, l, p, h0, h1);
-            Transformer.attend(c, b, l, p, h0, h1);
-            _saveVec(SCRATCH_AO, b.attnOut, h0 * c.hs, (h1 - h0) * c.hs);
-            head = h1;
-            if (h1 == c.nHeads) phase = 2;
+            _phaseAttend(chunks, o, c, b, p);
             return false;
         }
+        _phaseProject(chunks, o, c, b);
+        return true;
+    }
 
+    /// @dev PREPARE. The slice holds exactly this layer's rows and this position's RoPE
+    ///      row, so the phase runs against a one-layer config at layer 0, position 0 —
+    ///      the offsets it computes then land inside the slice, and the arithmetic is
+    ///      the same arithmetic the whole-blob path performs.
+    function _phasePrepare(
+        address[] memory chunks,
+        Transformer.Layout memory o,
+        Transformer.Config memory c,
+        Transformer.Buffers memory b,
+        uint256 p
+    ) private {
+        uint256 l = layer;
+        (bytes memory w, Transformer.Layout memory s) = Transformer.slicePrepare(chunks, o, c, l, p);
+        Transformer.prepare(w, s, Transformer.sliced(c), b, 0, 0);
+        _storeKvRow(c, b, l, p);
+        _saveVec(0, b.query, 0, c.dim);
+        phase = 1;
+        head = 0;
+    }
+
+    /// @dev ATTEND. Needs no weights at all — only the query and the KV cache — which is
+    ///      why the phase that grows with position is also the cheapest to set up.
+    function _phaseAttend(
+        address[] memory chunks,
+        Transformer.Layout memory o,
+        Transformer.Config memory c,
+        Transformer.Buffers memory b,
+        uint256 p
+    ) private {
+        chunks;
+        o;
+        uint256 l = layer;
+        uint256 h0 = head;
+        uint256 h1 = h0 + c.nHeads / c.nKv;
+        if (h1 > c.nHeads) h1 = c.nHeads;
+        _loadVec(0, b.query, 0, c.dim);
+        // Only this head range's slice of the KV cache is touched, so only that slice
+        // is read back — the saving grows with position and is what keeps an ATTEND
+        // phase affordable deep into a sequence.
+        _loadKvHeads(c, b, l, p, h0, h1);
+        Transformer.attend(c, b, l, p, h0, h1);
+        _saveVec(SCRATCH_AO, b.attnOut, h0 * c.hs, (h1 - h0) * c.hs);
+        head = h1;
+        if (h1 == c.nHeads) phase = 2;
+    }
+
+    /// @dev PROJECT: output projection, residual, and the feed-forward network
+    function _phaseProject(
+        address[] memory chunks,
+        Transformer.Layout memory o,
+        Transformer.Config memory c,
+        Transformer.Buffers memory b
+    ) private {
+        uint256 l = layer;
         _loadVec(SCRATCH_AO, b.attnOut, 0, c.dim);
-        Transformer.project(w, o, c, b, l);
+        (bytes memory w, Transformer.Layout memory s) = Transformer.sliceProject(chunks, o, c, l);
+        Transformer.project(w, s, Transformer.sliced(c), b, 0);
         phase = 0;
         head = 0;
         layer = l + 1;
-        return true;
     }
 
     /// @dev Save `len` values of `src` from `off`, packed four int64 lanes per slot.

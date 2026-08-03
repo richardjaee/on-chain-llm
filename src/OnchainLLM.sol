@@ -52,8 +52,17 @@ contract OnchainLLM {
     ///         0 PREPARE, 1 ATTEND, 2 W_o, 3 SwiGLU, 4 W_2
     uint256 public phase;
     /// @notice Position within the current phase: the next head for ATTEND, the next
-    ///         output row for the three matmul phases.
+    ///         output row for the matmul phases, the next vocabulary row for the
+    ///         classifier.
     uint256 public cursor;
+
+    /// @dev Running argmax over the vocabulary, carried across classifier shards. The
+    ///      logits themselves are never stored: each shard scans its own rows and keeps
+    ///      only whichever is best so far, which is what makes a 32k vocabulary a
+    ///      bounded amount of state rather than 32k words of it. `>` rather than `>=`
+    ///      keeps the first maximum winning, matching FixedPoint.argmax.
+    int256 private _bestVal;
+    uint256 private _bestIdx;
 
     /// @dev Residual stream carried between layer steps (Q32)
     int256[] private _x;
@@ -160,23 +169,26 @@ contract OnchainLLM {
         // the positions attention will actually read. EVM memory is quadratic, so the
         // difference between this and `nLayers * maxPos` is worth hundreds of thousands
         // of gas on every transaction — and the saving grows with the requested maxNew.
-        Transformer.Buffers memory b = Transformer.newBuffers(c, lo == c.nLayers ? 1 : p + 1, 1);
+        // The classifier needs no KV cache and only a shard's worth of logits; a layer
+        // phase needs the cache up to this position and no logits at all.
+        Transformer.Buffers memory b = lo == c.nLayers
+            ? Transformer.newBuffers(c, 1, 1, Transformer.rowsPerPhase(macsPerPhase, c.dim, c.vocab))
+            : Transformer.newBuffers(c, p + 1, 1, 1);
         int256[] memory xs = _x;
         for (uint256 i = 0; i < c.dim; ++i) {
             b.resid[i] = xs[i];
         }
 
         if (lo == c.nLayers) {
-            // classifier stage — skipped entirely while still inside the prompt,
-            // where the next token is teacher-forced and the logits are discarded
-            steps += 1;
-            if (p + 1 >= promptIds.length) {
-                (bytes memory cw, Transformer.Layout memory co) = Transformer.sliceClassify(chunks, o, c);
-                Transformer.normFinal(cw, co, c, b);
-                Transformer.classifyRange(cw, co, c, b, 0, c.vocab);
+            // Inside the prompt the next token is already known, so the classifier is
+            // skipped entirely rather than computed and discarded.
+            if (p + 1 < promptIds.length) {
+                steps += 1;
+                emit StepRun(p, lo, steps, 5);
+                _emit(p, promptIds[p + 1], true);
+                return;
             }
-            emit StepRun(p, lo, steps, 5);
-            _emit(b, p, p + 1 < promptIds.length);
+            _classify(chunks, o, c, b, p, reserve);
             return;
         }
 
@@ -406,19 +418,75 @@ contract OnchainLLM {
         return a;
     }
 
+    /// @dev The classifier, sharded over the vocabulary. It is the largest single
+    ///      matmul in the model — rows equal to the vocabulary, each `dim` wide — so at
+    ///      any realistic vocabulary it is the first thing that cannot fit in one
+    ///      transaction. At 32k rows and dim 2048 it is roughly 3.2 BILLION gas whole.
+    ///
+    ///      Rows are independent, so shards need no partial sums. What they do need is
+    ///      the argmax, and carrying that as a running best value and index costs two
+    ///      slots instead of a logit vector the width of the vocabulary.
+    function _classify(
+        address[] memory chunks,
+        Transformer.Layout memory o,
+        Transformer.Config memory c,
+        Transformer.Buffers memory b,
+        uint256 p,
+        uint256 reserve
+    ) private {
+        if (cursor == 0) {
+            (bytes memory rw, Transformer.Layout memory ro) = Transformer.sliceRmsFinal(chunks, o, c);
+            Transformer.rmsnorm(rw, ro.rmsFinal, 0, b.resid, b.normed, c.dim);
+            _saveVec(SCRATCH_NORM, b.normed, 0, c.dim);
+            _bestVal = type(int256).min;
+            _bestIdx = 0;
+        }
+        _loadVec(SCRATCH_NORM, b.normed, 0, c.dim);
+
+        int256 bestVal = _bestVal;
+        uint256 bestIdx = _bestIdx;
+        uint256 worst = 0;
+        uint256 ran = 0;
+
+        while (cursor < c.vocab) {
+            uint256 before = gasleft();
+            if (ran > 0 && before < worst + worst / 3 + reserve) break;
+            uint256 r0 = cursor;
+            uint256 n = Transformer.rowsPerPhase(macsPerPhase, c.dim, c.vocab - r0);
+            (bytes memory w, Transformer.Layout memory s) = Transformer.sliceClassifyRows(chunks, o, c, r0, n);
+            Transformer.classifyShard(w, s, c, b, n);
+            for (uint256 i = 0; i < n; ++i) {
+                if (b.logits[i] > bestVal) {
+                    bestVal = b.logits[i];
+                    bestIdx = r0 + i;
+                }
+            }
+            cursor = r0 + n;
+            uint256 cost = before - gasleft();
+            if (cost > worst) worst = cost;
+            unchecked {
+                ran += 1;
+            }
+        }
+
+        steps += ran;
+        _bestVal = bestVal;
+        _bestIdx = bestIdx;
+        emit StepRun(p, c.nLayers, steps, 5);
+        if (cursor == c.vocab) _emit(p, bestIdx, false);
+    }
+
     /// @dev Pick the next token (or teacher-force from the prompt) and advance
-    function _emit(Transformer.Buffers memory b, uint256 p, bool inPrompt) private {
-        uint256 next;
+    function _emit(uint256 p, uint256 next, bool inPrompt) private {
         bool stop = false;
-        if (inPrompt) {
-            next = promptIds[p + 1];
-        } else {
-            next = FixedPoint.argmax(b.logits);
+        if (!inPrompt) {
             generated.push(uint16(next));
             emit TokenEmitted(p, uint16(next), steps);
             if (next == Decoder.BOS || next == Decoder.EOS) stop = true;
         }
         layer = 0;
+        phase = 0;
+        cursor = 0;
         pos = p + 1;
         if (stop || pos + 1 > maxPos - 1) {
             finished = true;
@@ -451,7 +519,8 @@ contract OnchainLLM {
             + _chunkCount(c.dim, c.dim) // W_o
             + _chunkCount(c.hidden, c.dim) // SwiGLU
             + _chunkCount(c.dim, c.hidden); // W_2
-        return perLayer * c.nLayers + 1; // + the classifier
+        // The classifier is itself sharded over the vocabulary
+        return perLayer * c.nLayers + _chunkCount(c.vocab, c.dim);
     }
 
     /// @dev Walk the same cursor the phases walk, so the count matches exactly

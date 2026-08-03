@@ -262,6 +262,18 @@ library Transformer {
         pure
         returns (Buffers memory b)
     {
+        return newBuffers(c, maxPos, cacheLayers, c.vocab);
+    }
+
+    /// @notice As above, but with the logits buffer sized to `logitsLen`.
+    /// @dev A sharded classifier scans each shard for its maximum and keeps only the
+    ///      best value and index, so it never needs room for the whole vocabulary. At
+    ///      a realistic 32k vocabulary that array alone would dominate memory.
+    function newBuffers(Config memory c, uint256 maxPos, uint256 cacheLayers, uint256 logitsLen)
+        internal
+        pure
+        returns (Buffers memory b)
+    {
         b.resid = new int256[](c.dim);
         b.normed = new int256[](c.dim);
         b.query = new int256[](c.dim);
@@ -271,7 +283,7 @@ library Transformer {
         b.proj = new int256[](c.dim);
         b.gate = new int256[](c.hidden);
         b.up = new int256[](c.hidden);
-        b.logits = new int256[](c.vocab);
+        b.logits = new int256[](logitsLen);
         b.keyCache = new int256[](cacheLayers * maxPos * c.kvd);
         b.valueCache = new int256[](cacheLayers * maxPos * c.kvd);
         b.attnWeights = new int256[](maxPos);
@@ -433,6 +445,28 @@ library Transformer {
         at += _sliceRows(chunks, data, at, o.w2, uint256(c.nLayers) * dim, l * dim, dim, hid);
         s.w3 = at;
         at += _sliceRows(chunks, data, at, o.w3, uint256(c.nLayers) * hid, l * hid, hid, dim);
+    }
+
+    /// @notice W_cls rows [r0, r0+n) — one shard of the classifier
+    function sliceClassifyRows(address[] memory chunks, Layout memory o, Config memory c, uint256 r0, uint256 n)
+        internal
+        view
+        returns (bytes memory data, Layout memory s)
+    {
+        data = new bytes(blockSize(n, c.dim) + SLICE_PAD);
+        s.wcls = 0;
+        _sliceRows(chunks, data, 0, o.wcls, c.vocab, r0, n, c.dim);
+    }
+
+    /// @notice The final RMSNorm gains, as a single-row block
+    function sliceRmsFinal(address[] memory chunks, Layout memory o, Config memory c)
+        internal
+        view
+        returns (bytes memory data, Layout memory s)
+    {
+        data = new bytes(1 + c.dim * 2 + SLICE_PAD);
+        s.rmsFinal = 0;
+        WeightStore.readRangeAt(chunks, o.rmsFinal, 1 + c.dim * 2, data, 0);
     }
 
     /// @notice Weights for the classifier: final RMSNorm gains and the whole W_cls
@@ -663,6 +697,14 @@ library Transformer {
     /// @notice Final RMSNorm, leaving the normed vector in b.normed
     function normFinal(bytes memory w, Layout memory o, Config memory c, Buffers memory b) internal pure {
         rmsnorm(w, o.rmsFinal, 0, b.resid, b.normed, c.dim);
+    }
+
+    /// @notice One classifier shard: `n` rows of a slice, into logits[0, n)
+    function classifyShard(bytes memory w, Layout memory s, Config memory c, Buffers memory b, uint256 n)
+        internal
+        pure
+    {
+        matmul(w, s.wcls, n, 0, n, c.dim, b.normed, b.logits, 0);
     }
 
     /// @notice Classifier rows [lo, hi) into b.logits

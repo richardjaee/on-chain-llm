@@ -125,6 +125,38 @@ contract ProfileTest is Test {
         assertLt(peak, 14_000_000, "a step exceeded the per-transaction ceiling");
     }
 
+    /// @notice Find the position at which a single layer no longer fits in one
+    ///         transaction. Past this point the run strands: a layer is already the
+    ///         smallest unit `step` can execute, so there is nothing left to split.
+    function test_FindStrandPosition() public {
+        uint16[] memory prompt = new uint16[](5);
+        prompt[0] = 1;
+        prompt[1] = 320;
+        prompt[2] = 327;
+        prompt[3] = 261;
+        prompt[4] = 276;
+        llm.start(prompt, 120);
+
+        uint256 lastPos;
+        for (uint256 i = 0; i < 2000; ++i) {
+            (uint256 p,,, bool done,) = llm.progress();
+            if (done) break;
+            uint256 g = gasleft();
+            try llm.step{gas: 14_000_000}(400_000) {
+                uint256 used = g - gasleft();
+                if (p != lastPos) {
+                    console2.log("pos", p, "step gas", used);
+                    lastPos = p;
+                }
+            } catch {
+                console2.log("STRANDED at position", p);
+                console2.log("  a single layer no longer fits under 14,000,000 gas");
+                return;
+            }
+        }
+        console2.log("completed without stranding");
+    }
+
     /// @notice Cost of ONE layer's compute, isolated from setup and storage
     function test_ProfileOneLayer() public view {
         Transformer.Config memory c = llm.config();

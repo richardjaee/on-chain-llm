@@ -49,7 +49,7 @@ contract OnchainLLM {
     uint256 public steps;
 
     /// @notice Which phase of the current layer runs next.
-    ///         0 PREPARE, 1 ATTEND, 2 W_o, 3 SwiGLU, 4 W_2
+    ///         0 W_q, 1 W_k/W_v, 2 ATTEND, 3 W_o, 4 SwiGLU, 5 W_2
     uint256 public phase;
     /// @notice Position within the current phase: the next head for ATTEND, the next
     ///         output row for the matmul phases, the next vocabulary row for the
@@ -184,7 +184,7 @@ contract OnchainLLM {
             // skipped entirely rather than computed and discarded.
             if (p + 1 < promptIds.length) {
                 steps += 1;
-                emit StepRun(p, lo, steps, 5);
+                emit StepRun(p, lo, steps, 6);
                 _emit(p, promptIds[p + 1], true);
                 return;
             }
@@ -246,26 +246,42 @@ contract OnchainLLM {
     ) private returns (bool residChanged) {
         uint256 ph = phase;
         if (ph == 0) {
-            _phasePrepare(chunks, o, c, b, p);
+            _phaseQ(chunks, o, c, b, p);
             return false;
         }
         if (ph == 1) {
+            _phaseKv(chunks, o, c, b, p);
+            return false;
+        }
+        if (ph == 2) {
             _phaseAttend(chunks, o, c, b, p);
             return false;
         }
-        if (ph == 2) return _phaseWo(chunks, o, c, b);
-        if (ph == 3) {
+        if (ph == 3) return _phaseWo(chunks, o, c, b);
+        if (ph == 4) {
             _phaseFfn1(chunks, o, c, b);
             return false;
         }
         return _phaseFfn2(chunks, o, c, b);
     }
 
-    /// @dev PREPARE. The slice holds exactly this layer's rows and this position's RoPE
-    ///      row, so the phase runs against a one-layer config at layer 0, position 0 —
-    ///      the offsets it computes then land inside the slice, and the arithmetic is
-    ///      the same arithmetic the whole-blob path performs.
-    function _phasePrepare(
+    /// @dev A shard must be a whole number of heads, so RoPE lands on heads this shard
+    ///      actually produced, and a whole number of packed slots, so two shards never
+    ///      share one. Aligning to both is aligning to their least common multiple.
+    function _headAligned(uint256 n, uint256 hs, uint256 left) private pure returns (uint256) {
+        if (n >= left) return left;
+        uint256 unit = hs;
+        while (unit % PACK_N != 0) {
+            unit += hs;
+        }
+        uint256 a = (n / unit) * unit;
+        if (a == 0) a = unit < left ? unit : left;
+        return a;
+    }
+
+    /// @dev W_q shard. The layer's RMSNorm is taken on the first shard and checkpointed,
+    ///      since every shard of Q, K and V consumes the same normalised vector.
+    function _phaseQ(
         address[] memory chunks,
         Transformer.Layout memory o,
         Transformer.Config memory c,
@@ -273,12 +289,44 @@ contract OnchainLLM {
         uint256 p
     ) private {
         uint256 l = layer;
-        (bytes memory w, Transformer.Layout memory s) = Transformer.slicePrepare(chunks, o, c, l, p);
-        Transformer.prepare(w, s, Transformer.sliced(c), b, 0, 0);
-        _storeKvRow(c, b, l, p);
-        _saveVec(0, b.query, 0, c.dim);
-        phase = 1;
-        cursor = 0;
+        uint256 r0 = cursor;
+        if (r0 == 0) {
+            (bytes memory rw, Transformer.Layout memory ro) = Transformer.sliceRmsAtt(chunks, o, c, l);
+            Transformer.rmsnorm(rw, ro.rmsAtt, 0, b.resid, b.normed, c.dim);
+            _saveVec(SCRATCH_NORM, b.normed, 0, c.dim);
+        }
+        _loadVec(SCRATCH_NORM, b.normed, 0, c.dim);
+        uint256 n = _headAligned(Transformer.rowsPerPhase(macsPerPhase, c.dim, c.dim - r0), c.hs, c.dim - r0);
+        (bytes memory w, Transformer.Layout memory s) = Transformer.sliceQRows(chunks, o, c, l, p, r0, n);
+        Transformer.prepareQ(w, s, c, b, r0, n);
+        _saveVec(0, b.query, r0, n);
+        cursor = r0 + n;
+        if (cursor == c.dim) {
+            phase = 1;
+            cursor = 0;
+        }
+    }
+
+    /// @dev W_k / W_v shard, written straight through to the KV cache in storage
+    function _phaseKv(
+        address[] memory chunks,
+        Transformer.Layout memory o,
+        Transformer.Config memory c,
+        Transformer.Buffers memory b,
+        uint256 p
+    ) private {
+        uint256 l = layer;
+        uint256 r0 = cursor;
+        _loadVec(SCRATCH_NORM, b.normed, 0, c.dim);
+        uint256 n = _headAligned(Transformer.rowsPerPhase(macsPerPhase, c.dim, c.kvd - r0), c.hs, c.kvd - r0);
+        (bytes memory w, Transformer.Layout memory s) = Transformer.sliceKvRows(chunks, o, c, l, p, r0, n);
+        Transformer.prepareKv(w, s, c, b, r0, n);
+        _storeKvRange(c, b, l, p, r0, n);
+        cursor = r0 + n;
+        if (cursor == c.kvd) {
+            phase = 2;
+            cursor = 0;
+        }
     }
 
     /// @dev ATTEND. Needs no weights at all — only the query and the KV cache — which is
@@ -305,7 +353,7 @@ contract OnchainLLM {
         _saveVec(SCRATCH_AO, b.attnOut, h0 * c.hs, (h1 - h0) * c.hs);
         cursor = h1;
         if (h1 == c.nHeads) {
-            phase = 2;
+            phase = 3;
             cursor = 0;
         }
     }
@@ -334,7 +382,7 @@ contract OnchainLLM {
             (bytes memory rw, Transformer.Layout memory ro) = Transformer.sliceRmsFfn(chunks, o, c, l);
             Transformer.rmsnorm(rw, ro.rmsFfn, 0, b.resid, b.normed, c.dim);
             _saveVec(SCRATCH_NORM, b.normed, 0, c.dim);
-            phase = 3;
+            phase = 4;
             cursor = 0;
         }
         return true;
@@ -356,7 +404,7 @@ contract OnchainLLM {
         _saveVec(SCRATCH_GATE, b.gate, r0, n);
         cursor = r0 + n;
         if (cursor == c.hidden) {
-            phase = 4;
+            phase = 5;
             cursor = 0;
         }
     }
@@ -472,7 +520,7 @@ contract OnchainLLM {
         steps += ran;
         _bestVal = bestVal;
         _bestIdx = bestIdx;
-        emit StepRun(p, c.nLayers, steps, 5);
+        emit StepRun(p, c.nLayers, steps, 6);
         if (cursor == c.vocab) _emit(p, bestIdx, false);
     }
 
@@ -514,7 +562,8 @@ contract OnchainLLM {
     ///      a different answer. Deriving it here is what keeps a client model-agnostic.
     function phasesPerPosition() public view returns (uint256) {
         Transformer.Config memory c = config();
-        uint256 perLayer = 1 // PREPARE
+        uint256 perLayer = _chunkCount(c.dim, c.dim) // W_q
+            + _chunkCount(c.kvd, c.dim) // W_k / W_v
             + c.nKv // ATTEND, one phase per KV head
             + _chunkCount(c.dim, c.dim) // W_o
             + _chunkCount(c.hidden, c.dim) // SwiGLU
@@ -624,12 +673,20 @@ contract OnchainLLM {
         }
     }
 
-    function _storeKvRow(Transformer.Config memory c, Transformer.Buffers memory b, uint256 l, uint256 p) private {
-        uint256 kvd = c.kvd;
-        for (uint256 i = 0; i < kvd; i += PACK_N) {
-            uint256 n = kvd - i < PACK_N ? kvd - i : PACK_N;
-            _kv[_key(c, false, l, p, i / PACK_N)] = _pack(b.key, i, n);
-            _kv[_key(c, true, l, p, i / PACK_N)] = _pack(b.value, i, n);
+    /// @dev Write K/V lanes [r0, r0+n) of this position's row. Shards write their own
+    ///      slice straight through, so the full vector never has to exist at once.
+    function _storeKvRange(
+        Transformer.Config memory c,
+        Transformer.Buffers memory b,
+        uint256 l,
+        uint256 p,
+        uint256 r0,
+        uint256 n
+    ) private {
+        for (uint256 i = r0; i < r0 + n; i += PACK_N) {
+            uint256 k = r0 + n - i < PACK_N ? r0 + n - i : PACK_N;
+            _kv[_key(c, false, l, p, i / PACK_N)] = _pack(b.key, i, k);
+            _kv[_key(c, true, l, p, i / PACK_N)] = _pack(b.value, i, k);
         }
     }
 }

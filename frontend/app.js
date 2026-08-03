@@ -22,7 +22,8 @@ const RPCS = ["https://sepolia.base.org", "https://base-sepolia-rpc.publicnode.c
  * deployment's MAC budget, so this console works against a model it has never seen. */
 let geom = null;
 const PHASE_NAMES = [
-  "Q/K/V projection",
+  "query projection",
+  "key/value projection",
   "attention",
   "output projection",
   "SwiGLU feed-forward",
@@ -112,18 +113,20 @@ function phaseOps(phase, pos) {
   const keys = pos + 1;
   switch (phase) {
     case 0:
-      return `RMSNorm → Q/K/V projections (${g.dim}→${g.dim}/${g.kvd}) → RoPE → KV cache write`;
+      return `RMSNorm → W_q rows (${g.dim}→${g.dim}) → RoPE`;
     case 1:
+      return `W_k / W_v rows (${g.dim}→${g.kvd}) → RoPE → KV cache write`;
+    case 2:
       return `causal attention, ${g.nHeads / g.nKv} head${g.nHeads / g.nKv === 1 ? "" : "s"} ` +
              `over ${keys} key${keys === 1 ? "" : "s"}`;
-    case 2:
-      return `output projection (${g.dim}→${g.dim}) → residual`;
     case 3:
-      return `SwiGLU feed-forward (${g.dim}→${g.hidden})`;
+      return `W_o rows (${g.dim}→${g.dim}) → residual`;
     case 4:
-      return `FFN projection (${g.hidden}→${g.dim}) → residual`;
+      return `SwiGLU feed-forward, W_1 and W_3 rows (${g.dim}→${g.hidden})`;
+    case 5:
+      return `W_2 rows (${g.hidden}→${g.dim}) → residual`;
     default:
-      return `final RMSNorm → logits over ${g.vocab} vocabulary rows → greedy argmax`;
+      return `final RMSNorm → W_cls rows over ${g.vocab} vocabulary entries → running argmax`;
   }
 }
 
@@ -177,7 +180,7 @@ function describeReceipt(r, hash) {
   if (!stepRun) { addTx({ kind: "step", msg: "no StepRun event found", gas: r.gasUsed, hash, cls: "note" }); return null; }
 
   const nLayers = geom ? geom.nLayers : Infinity;
-  const isClassifier = !!emitted || stepRun.phase === 5 || stepRun.layer >= nLayers;
+  const isClassifier = !!emitted || stepRun.phase === 6 || stepRun.layer >= nLayers;
 
   if (isClassifier) {
     const piece = emitted ? tok.decode([emitted.token], 0) : undefined;

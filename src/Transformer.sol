@@ -201,6 +201,31 @@ library Transformer {
         }
     }
 
+    /// @notice Rotate heads [h0, h1) only — used when Q/K are produced a shard at a time
+    function ropeRange(
+        bytes memory w,
+        Layout memory o,
+        Config memory c,
+        int256[] memory v,
+        uint256 h0,
+        uint256 h1,
+        uint256 pos
+    ) internal pure {
+        uint256 half = c.hs / 2;
+        uint256 rowOff = pos * half * 4;
+        for (uint256 h = h0; h < h1; ++h) {
+            for (uint256 q = 0; q < half; ++q) {
+                int256 cs = _i32(w, o.ropeCos + rowOff + q * 4);
+                int256 sn = _i32(w, o.ropeSin + rowOff + q * 4);
+                uint256 i = h * c.hs + 2 * q;
+                int256 v0 = v[i];
+                int256 v1 = v[i + 1];
+                v[i] = (v0 * cs - v1 * sn) >> 30;
+                v[i + 1] = (v0 * sn + v1 * cs) >> 30;
+            }
+        }
+    }
+
     /// @notice Rotate consecutive pairs within each head using the Q30 RoPE tables
     function rope(bytes memory w, Layout memory o, Config memory c, int256[] memory v, uint256 nHeads, uint256 pos)
         internal
@@ -513,6 +538,83 @@ library Transformer {
             shared: c.shared,
             invSqrtHs: c.invSqrtHs
         });
+    }
+
+    /// @notice The rms_att gains for one layer, as a single-row block
+    function sliceRmsAtt(address[] memory chunks, Layout memory o, Config memory c, uint256 l)
+        internal
+        view
+        returns (bytes memory data, Layout memory s)
+    {
+        data = new bytes(1 + c.dim * 2 + SLICE_PAD);
+        s.rmsAtt = 0;
+        WeightStore.readRangeAt(chunks, o.rmsAtt, 1, data, 0);
+        WeightStore.readRangeAt(chunks, o.rmsAtt + 1 + l * c.dim * 2, c.dim * 2, data, 1);
+    }
+
+    /// @notice W_q rows [r0, r0+n) plus this position's RoPE row
+    function sliceQRows(
+        address[] memory chunks,
+        Layout memory o,
+        Config memory c,
+        uint256 l,
+        uint256 pos,
+        uint256 r0,
+        uint256 n
+    ) internal view returns (bytes memory data, Layout memory s) {
+        uint256 half = c.hs / 2;
+        uint256 body = blockSize(n, c.dim);
+        data = new bytes(body + half * 8 + SLICE_PAD);
+        s.wq = 0;
+        _sliceRows(chunks, data, 0, o.wq, uint256(c.nLayers) * c.dim, l * c.dim + r0, n, c.dim);
+        s.ropeCos = body;
+        WeightStore.readRangeAt(chunks, o.ropeCos + pos * half * 4, half * 4, data, body);
+        s.ropeSin = body + half * 4;
+        WeightStore.readRangeAt(chunks, o.ropeSin + pos * half * 4, half * 4, data, body + half * 4);
+    }
+
+    /// @notice W_k and W_v rows [r0, r0+n) plus this position's RoPE row
+    function sliceKvRows(
+        address[] memory chunks,
+        Layout memory o,
+        Config memory c,
+        uint256 l,
+        uint256 pos,
+        uint256 r0,
+        uint256 n
+    ) internal view returns (bytes memory data, Layout memory s) {
+        uint256 half = c.hs / 2;
+        uint256 one = blockSize(n, c.dim);
+        data = new bytes(one * 2 + half * 8 + SLICE_PAD);
+        s.wk = 0;
+        _sliceRows(chunks, data, 0, o.wk, uint256(c.nLayers) * c.kvd, l * c.kvd + r0, n, c.dim);
+        s.wv = one;
+        _sliceRows(chunks, data, one, o.wv, uint256(c.nLayers) * c.kvd, l * c.kvd + r0, n, c.dim);
+        s.ropeCos = one * 2;
+        WeightStore.readRangeAt(chunks, o.ropeCos + pos * half * 4, half * 4, data, one * 2);
+        s.ropeSin = one * 2 + half * 4;
+        WeightStore.readRangeAt(chunks, o.ropeSin + pos * half * 4, half * 4, data, one * 2 + half * 4);
+    }
+
+    /// @notice One Q shard: rows [r0, r0+n) of W_q, rotated in place
+    /// @dev `n` is a whole number of heads, so RoPE can be applied to exactly the heads
+    ///      this shard produced and never has to revisit them.
+    function prepareQ(bytes memory w, Layout memory s, Config memory c, Buffers memory b, uint256 r0, uint256 n)
+        internal
+        pure
+    {
+        matmul(w, s.wq, n, 0, n, c.dim, b.normed, b.query, r0);
+        ropeRange(w, s, c, b.query, r0 / c.hs, (r0 + n) / c.hs, 0);
+    }
+
+    /// @notice One K/V shard: rows [r0, r0+n) of W_k and W_v, K rotated in place
+    function prepareKv(bytes memory w, Layout memory s, Config memory c, Buffers memory b, uint256 r0, uint256 n)
+        internal
+        pure
+    {
+        matmul(w, s.wk, n, 0, n, c.dim, b.normed, b.key, r0);
+        matmul(w, s.wv, n, 0, n, c.dim, b.normed, b.value, r0);
+        ropeRange(w, s, c, b.key, r0 / c.hs, (r0 + n) / c.hs, 0);
     }
 
     /// @notice PREPARE: everything a layer does before attention

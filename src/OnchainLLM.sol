@@ -79,7 +79,7 @@ contract OnchainLLM {
     ///      the same KV slice, and that read is the part that grows with position.
 
     event GenerationStarted(uint256 promptLen, uint256 maxPos);
-    event StepRun(uint256 indexed pos, uint256 indexed layer, uint256 stepIndex);
+    event StepRun(uint256 indexed pos, uint256 indexed layer, uint256 stepIndex, uint256 phase);
     event TokenEmitted(uint256 indexed pos, uint16 token, uint256 stepIndex);
     event GenerationFinished(uint256 tokens, uint256 totalSteps);
 
@@ -175,7 +175,7 @@ contract OnchainLLM {
                 Transformer.normFinal(cw, co, c, b);
                 Transformer.classifyRange(cw, co, c, b, 0, c.vocab);
             }
-            emit StepRun(p, lo, steps);
+            emit StepRun(p, lo, steps, 5);
             _emit(b, p, p + 1 < promptIds.length);
             return;
         }
@@ -218,7 +218,7 @@ contract OnchainLLM {
             _x = xs;
         }
         steps += ran;
-        emit StepRun(p, layer, steps);
+        emit StepRun(p, layer, steps, phase);
     }
 
     /// @dev Run one phase of the current layer and advance the cursors.
@@ -437,6 +437,32 @@ contract OnchainLLM {
 
     function generatedIds() external view returns (uint16[] memory) {
         return generated;
+    }
+
+    /// @notice How many phases one position costs, for this model and this MAC budget.
+    /// @dev Clients need it to size funding and batches, and it must not be a constant
+    ///      they carry: it depends on the layer count, the KV head count, the tensor
+    ///      widths and the budget, so a different model or a different deployment gives
+    ///      a different answer. Deriving it here is what keeps a client model-agnostic.
+    function phasesPerPosition() public view returns (uint256) {
+        Transformer.Config memory c = config();
+        uint256 perLayer = 1 // PREPARE
+            + c.nKv // ATTEND, one phase per KV head
+            + _chunkCount(c.dim, c.dim) // W_o
+            + _chunkCount(c.hidden, c.dim) // SwiGLU
+            + _chunkCount(c.dim, c.hidden); // W_2
+        return perLayer * c.nLayers + 1; // + the classifier
+    }
+
+    /// @dev Walk the same cursor the phases walk, so the count matches exactly
+    function _chunkCount(uint256 rows, uint256 cols) private view returns (uint256 n) {
+        uint256 r = 0;
+        while (r < rows) {
+            r += _packAligned(Transformer.rowsPerPhase(macsPerPhase, cols, rows - r), rows - r);
+            unchecked {
+                n += 1;
+            }
+        }
     }
 
     function progress()

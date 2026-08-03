@@ -148,7 +148,10 @@
           The model has <strong>5 layers</strong>. Each transaction computes exactly one of
           them for the current token position, then writes the residual stream and that
           layer's KV cache back to storage. A sixth transaction runs the classifier and
-          emits the token. So one token = <strong>6 transactions</strong>.
+          emits the token. A layer is split further still — projections, attention one KV
+          head at a time, then the feed-forward network in row-sized pieces — so that no
+          single piece can outgrow a transaction as context or model size increases. The
+          exact count per token is read from the contract, not assumed.
         </p>
         <details>
           <summary>Signing key &amp; contract</summary>

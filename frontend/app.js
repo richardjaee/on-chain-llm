@@ -15,8 +15,20 @@ const CHAIN_ID_HEX = "0x14a34";
 const DEFAULT_CONTRACT = "0x77D4fd6B1fcA991d586c75A94008441947B8Eb0b";
 const RPCS = ["https://sepolia.base.org", "https://base-sepolia-rpc.publicnode.com"];
 
-/* stories260K geometry — used only for labelling the feed */
-const N_LAYERS = 5, N_HEADS = 8, N_KV = 4, DIM = 64, HIDDEN = 172, VOCAB = 512;
+/* Model geometry is read from the contract, never assumed. It decides how many
+ * phases a position costs, which drives both the funding estimate and the batch
+ * size — and it is different for every model and every deployment. `phasesPerPosition`
+ * is derived on chain from the layer count, KV heads, tensor widths and the
+ * deployment's MAC budget, so this console works against a model it has never seen. */
+let geom = null;
+const PHASE_NAMES = [
+  "Q/K/V projection",
+  "attention",
+  "output projection",
+  "SwiGLU feed-forward",
+  "FFN projection",
+  "classifier",
+];
 
 const ABI = [
   "function generatedIds() view returns (uint16[])",
@@ -26,7 +38,9 @@ const ABI = [
   "function finished() view returns (bool)",
   "function steps() view returns (uint256)",
   "function progress() view returns (uint256 pos, uint256 layer, uint256 maxPos, bool done, uint256 steps)",
-  "event StepRun(uint256 indexed pos, uint256 indexed layer, uint256 stepIndex)",
+  "function phasesPerPosition() view returns (uint256)",
+  "function config() view returns (tuple(uint32 dim,uint32 hidden,uint32 nLayers,uint32 nHeads,uint32 nKv,uint32 vocab,uint32 seqLen,uint32 hs,uint32 kvd,bool shared,uint64 invSqrtHs))",
+  "event StepRun(uint256 indexed pos, uint256 indexed layer, uint256 stepIndex, uint256 phase)",
   "event TokenEmitted(uint256 indexed pos, uint16 token, uint256 stepIndex)",
   "event GenerationFinished(uint256 tokens, uint256 totalSteps, string text)",
 ];
@@ -75,12 +89,42 @@ function status(msg, cls) { $("status").textContent = msg; $("status").className
 /* ------------------------------- the feed ------------------------------ */
 function feedReset() { $("feed").innerHTML = ""; feedCount = 0; clsSeen.clear(); }
 
-/** Describe what a layer step actually computed, in model terms. */
-function layerOps(pos) {
+/** Load the geometry once, so nothing about the model is assumed by this page. */
+async function loadGeom() {
+  if (geom) return geom;
+  geom = await withFailover(async (p) => {
+    const c = new E.Contract(addr(), ABI, p);
+    const [cfg, per] = await Promise.all([c.config(), c.phasesPerPosition()]);
+    return {
+      dim: Number(cfg.dim), hidden: Number(cfg.hidden), nLayers: Number(cfg.nLayers),
+      nHeads: Number(cfg.nHeads), nKv: Number(cfg.nKv), vocab: Number(cfg.vocab),
+      seqLen: Number(cfg.seqLen), hs: Number(cfg.hs), kvd: Number(cfg.kvd),
+      phasesPerPos: Number(per),
+    };
+  });
+  return geom;
+}
+
+/** Describe what a phase computed, in model terms, from the geometry on chain. */
+function phaseOps(phase, pos) {
+  const g = geom;
+  if (!g) return "";
   const keys = pos + 1;
-  return `RMSNorm → Q/K/V projections (${DIM}→${DIM}/${(DIM / N_HEADS) * N_KV}) → RoPE → ` +
-         `causal attention, ${N_HEADS} heads over ${keys} key${keys === 1 ? "" : "s"} → ` +
-         `output projection → SwiGLU FFN (${DIM}→${HIDDEN}→${DIM}) → residual`;
+  switch (phase) {
+    case 0:
+      return `RMSNorm → Q/K/V projections (${g.dim}→${g.dim}/${g.kvd}) → RoPE → KV cache write`;
+    case 1:
+      return `causal attention, ${g.nHeads / g.nKv} head${g.nHeads / g.nKv === 1 ? "" : "s"} ` +
+             `over ${keys} key${keys === 1 ? "" : "s"}`;
+    case 2:
+      return `output projection (${g.dim}→${g.dim}) → residual`;
+    case 3:
+      return `SwiGLU feed-forward (${g.dim}→${g.hidden})`;
+    case 4:
+      return `FFN projection (${g.hidden}→${g.dim}) → residual`;
+    default:
+      return `final RMSNorm → logits over ${g.vocab} vocabulary rows → greedy argmax`;
+  }
 }
 
 function addTx({ kind, layer, pos, gas, hash, token, piece, msg, cls }) {
@@ -89,12 +133,12 @@ function addTx({ kind, layer, pos, gas, hash, token, piece, msg, cls }) {
   feedCount++;
   let head, ops = "", emit = "";
   if (kind === "layer") {
-    head = `<span class="tx-kind">Layer ${layer} of ${N_LAYERS}</span>` +
+    head = `<span class="tx-kind">Layer ${layer} of ${geom ? geom.nLayers : "?"}</span>` +
            `<span class="tx-pos">token position ${pos}</span>`;
-    ops = `<div class="tx-ops">${layerOps(pos)}</div>`;
+    ops = `<div class="tx-ops">${msg || ""}</div>`;
   } else if (kind === "classifier") {
     head = `<span class="tx-kind">Classifier</span><span class="tx-pos">token position ${pos}</span>`;
-    ops = `<div class="tx-ops">final RMSNorm → logits over ${VOCAB} vocabulary rows → greedy argmax</div>`;
+    ops = `<div class="tx-ops">${phaseOps(5, pos)}</div>`;
     if (token !== undefined) {
       emit = `<div class="tx-emit">emitted token <strong>${token}</strong> → <span class="piece">${esc(piece || "")}</span></div>`;
     } else {
@@ -113,10 +157,9 @@ function addTx({ kind, layer, pos, gas, hash, token, piece, msg, cls }) {
   while ($("feed").children.length > 400) $("feed").lastChild.remove();
 }
 
-/* stepAuto emits the layer index it has advanced TO, not the one it just ran, so
- * `layer = 1` means "finished layer 1 of 5". The value N_LAYERS therefore appears
- * twice per position: once for the final layer, once again for the classifier
- * stage. Ordered processing disambiguates them. */
+/* `step` reports the layer and phase it has advanced TO, not the ones it just ran.
+ * The classifier is now identified by its phase rather than inferred from a repeated
+ * layer index, so no ordering state is needed to tell the two apart. */
 const clsSeen = new Set();
 
 /** Turn a receipt into feed entries using the contract's own events. */
@@ -126,15 +169,15 @@ function describeReceipt(r, hash) {
     let p;
     try { p = iface.parseLog({ topics: [...lg.topics], data: lg.data }); } catch (e) { continue; }
     if (!p) continue;
-    if (p.name === "StepRun") stepRun = { pos: Number(p.args.pos), layer: Number(p.args.layer) };
+    if (p.name === "StepRun") {
+      stepRun = { pos: Number(p.args.pos), layer: Number(p.args.layer), phase: Number(p.args.phase) };
+    }
     if (p.name === "TokenEmitted") emitted = { pos: Number(p.args.pos), token: Number(p.args.token) };
   }
   if (!stepRun) { addTx({ kind: "step", msg: "no StepRun event found", gas: r.gasUsed, hash, cls: "note" }); return null; }
 
-  const atEnd = stepRun.layer >= N_LAYERS;
-  const key = stepRun.pos;
-  const isClassifier = !!emitted || (atEnd && clsSeen.has(key));
-  if (atEnd) clsSeen.add(key);
+  const nLayers = geom ? geom.nLayers : Infinity;
+  const isClassifier = !!emitted || stepRun.phase === 5 || stepRun.layer >= nLayers;
 
   if (isClassifier) {
     const piece = emitted ? tok.decode([emitted.token], 0) : undefined;
@@ -142,8 +185,16 @@ function describeReceipt(r, hash) {
             token: emitted ? emitted.token : undefined, piece });
     return emitted ? { token: emitted.token, piece } : null;
   }
-  // layer value is 1-based already (it is the layer just completed)
-  addTx({ kind: "layer", layer: stepRun.layer, pos: stepRun.pos, gas: r.gasUsed, hash });
+  // `layer` and `phase` are what the contract advanced TO, so the label names the
+  // work this transaction stopped in front of rather than guessing from call order.
+  addTx({
+    kind: "layer",
+    layer: stepRun.layer,
+    pos: stepRun.pos,
+    gas: r.gasUsed,
+    hash,
+    msg: `next: ${PHASE_NAMES[stepRun.phase] || "?"} — ${phaseOps(stepRun.phase, stepRun.pos)}`,
+  });
   return null;
 }
 
@@ -359,7 +410,7 @@ async function runSteps() {
     // Never queue more steps than the run can still use. Overshoot is harmless — the
     // extra transactions revert with AlreadyFinished before touching state — but each
     // one still pays intrinsic gas, and a full batch of them is pure waste.
-    const left = Math.max(1, (live.maxPos - live.pos) * (N_LAYERS + 1) - live.layer);
+    const left = Math.max(1, (live.maxPos - live.pos) * geom.phasesPerPos);
     const want = Math.min(BATCH, left);
 
     // Fill the batch. Each call is only eth_sendRawTransaction — nothing is mined
@@ -416,7 +467,8 @@ async function generate() {
   if (!text) { status("Type a prompt first.", "bad"); return; }
   const ids = tok.encode(text);
   const maxNew = parseInt($("maxnew").value, 10);
-  const txCount = (ids.length + maxNew) * 6;
+  await loadGeom();
+  const txCount = (ids.length + maxNew) * geom.phasesPerPos;
 
   running = true; cancel = false; sessionGas = 0n; sessionTx = 0;
   $("go").disabled = true; $("stop").disabled = false;

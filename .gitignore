@@ -21,3 +21,6 @@ __pycache__/
 
 # Synthetic scaling blobs from tools/synth.py — large and regenerable
 artifacts/synth-*.hex
+
+# Converted model blobs and reference vectors — large, regenerable
+artifacts/synth-smol135m.hex

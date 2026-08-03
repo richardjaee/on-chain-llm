@@ -12,6 +12,11 @@ a multiply-divide.
 """
 import argparse, json, math, struct
 
+try:
+    import numpy as np
+except ImportError:  # the pure-Python path below is the reference; numpy only makes it
+    np = None        # survivable at scale — 134M weights as Python floats need ~5GB
+
 TENSOR_2D = ["tok_emb", "wq", "wk", "wv", "wo", "w1", "w2", "w3"]
 TENSOR_1D = ["rms_att", "rms_ffn", "rms_final"]
 
@@ -28,9 +33,10 @@ def read_checkpoint(path):
 
     def take(n):
         s = off[0]
-        vals = struct.unpack(f"<{n}f", blob[s:s + 4 * n])
         off[0] = s + 4 * n
-        return list(vals)
+        if np is not None:
+            return np.frombuffer(blob, dtype="<f4", count=n, offset=s)
+        return list(struct.unpack(f"<{n}f", blob[s:s + 4 * n]))
 
     w = {}
     w["tok_emb"] = take(vocab * dim)
@@ -57,11 +63,26 @@ def read_checkpoint(path):
 def quantize_rows(vals, rows, cols, bits=16):
     """Per-row power-of-two scale. Returns (ints, shift-per-row)."""
     lim = (1 << (bits - 1)) - 1
+    if np is not None and rows * cols > 100_000:
+        a = np.asarray(vals, dtype=np.float64).reshape(rows, cols)
+        mx = np.abs(a).max(axis=1)
+        # largest s with mx * 2^(s+1) <= lim, matching the loop below exactly
+        with np.errstate(divide="ignore"):
+            s = np.where(mx > 0, np.floor(np.log2(lim / np.maximum(mx, 1e-300))), 30.0)
+        s = np.clip(s, 0, 30).astype(np.int64)
+        # log2 can land a ulp off the integer boundary, so settle it by the same test
+        too_big = (mx * (2.0 ** (s + 1)) <= lim) & (s < 30) & (mx > 0)
+        s[too_big] += 1
+        too_small = (mx * (2.0 ** s) > lim) & (s > 0)
+        s[too_small] -= 1
+        q = np.rint(a * (2.0 ** s)[:, None])
+        q = np.clip(q, -lim - 1, lim).astype(np.int64)
+        return q.reshape(-1).tolist(), s.tolist()
     q = [0] * (rows * cols)
     shifts = []
     for r in range(rows):
         row = vals[r * cols:(r + 1) * cols]
-        mx = max(abs(v) for v in row) if row else 0.0
+        mx = max(abs(float(v)) for v in row) if len(row) else 0.0
         s = 0
         if mx > 0:
             while mx * (1 << (s + 1)) <= lim and s < 30:
@@ -71,19 +92,23 @@ def quantize_rows(vals, rows, cols, bits=16):
         shifts.append(s)
         base = r * cols
         for j, v in enumerate(row):
-            q[base + j] = min(lim, max(-lim - 1, round(v * (1 << s))))
+            q[base + j] = min(lim, max(-lim - 1, round(float(v) * (1 << s))))
     return q, shifts
 
 
-def rope_tables(cfg):
+def rope_tables(cfg, theta=10000.0):
     """cos/sin per position and pair, Q30. Recomputed rather than trusting the
-    legacy tables, which llama2.c itself ignores."""
+    legacy tables, which llama2.c itself ignores.
+
+    `theta` is the rotary base. llama2.c fixes it at 10000, but later models tune it —
+    Stentor3 uses 50000, Llama 3 uses 500000 — and it changes every angle in the table,
+    so a wrong value produces a model that reads as fluent nonsense rather than failing."""
     hs = cfg["hs"]
     cos_t, sin_t = [], []
     for pos in range(cfg["seqlen"]):
         c, s = [], []
         for i in range(hs // 2):
-            freq = 1.0 / (10000.0 ** (2 * i / hs))
+            freq = 1.0 / (theta ** (2 * i / hs))
             c.append(round(math.cos(pos * freq) * (1 << 30)))
             s.append(round(math.sin(pos * freq) * (1 << 30)))
         cos_t.append(c)
@@ -91,7 +116,7 @@ def rope_tables(cfg):
     return cos_t, sin_t
 
 
-def convert(path):
+def convert(path, theta=10000.0):
     cfg, w = read_checkpoint(path)
     dim, hidden, L = cfg["dim"], cfg["hidden"], cfg["n_layers"]
     kvd, vocab = cfg["kvd"], cfg["vocab"]
@@ -113,7 +138,7 @@ def convert(path):
     qw["wcls"], shifts["wcls"] = (qw["tok_emb"], shifts["tok_emb"]) if cfg["shared"] \
         else quantize_rows(w["wcls"], vocab, dim)
 
-    cos_t, sin_t = rope_tables(cfg)
+    cos_t, sin_t = rope_tables(cfg, theta)
     return cfg, qw, shifts, cos_t, sin_t
 
 
@@ -143,8 +168,11 @@ def build_blob(cfg, qw, shifts, cos_t, sin_t):
         sh = shifts[name]
         assert len(sh) == rows, f"{name}: {len(sh)} shifts for {rows} rows"
         out += bytes(sh)
-        for v in qw[name]:
-            out += struct.pack(">h", v)
+        if np is not None:
+            out += np.asarray(qw[name], dtype=">i2").tobytes()
+        else:
+            for v in qw[name]:
+                out += struct.pack(">h", v)
     for row in cos_t:
         for v in row:
             out += struct.pack(">i", v)
@@ -159,8 +187,9 @@ if __name__ == "__main__":
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", default="model.json")
     ap.add_argument("--blob", help="write the on-chain blob here as hex")
+    ap.add_argument("--rope-theta", type=float, default=10000.0, help="rotary base (llama2.c uses 10000)")
     a = ap.parse_args()
-    cfg, qw, shifts, cos_t, sin_t = convert(a.model)
+    cfg, qw, shifts, cos_t, sin_t = convert(a.model, a.rope_theta)
     json.dump({"cfg": cfg, "shifts": shifts}, open(a.out, "w"))
     print("config:", cfg)
     for k in sorted(shifts):

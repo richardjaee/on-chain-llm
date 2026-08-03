@@ -4,19 +4,18 @@ A language model that runs **entirely inside Ethereum transactions** — no oper
 off-chain compute, no trusted anything. The prompt goes in as token ids and every
 multiply-accumulate executes as EVM opcodes.
 
-Live on Base Sepolia: [`0x77D4fd6B1fcA991d586c75A94008441947B8Eb0b`](https://sepolia.basescan.org/address/0x77D4fd6B1fcA991d586c75A94008441947B8Eb0b)
+Live on Base Sepolia: [`0xc2ff49E48A5E7e2E472e6858610CF92BFbcD0e1C`](https://sepolia.basescan.org/address/0xc2ff49E48A5E7e2E472e6858610CF92BFbcD0e1C)
 
 ```
 prompt : Once upon a time          (5 tokens, maxNew = 8)
 output : , there was a little girl
 
-72 transactions · 256,410,750 gas · peak 11,928,695 per transaction
+52 transactions · 492 phases · ~405M gas · 12 blocks · 25 seconds
 ```
 
-Those figures are for that run, not constants of the model. Per-transaction cost rises
-with `maxNew` — `step` sizes its KV buffers for `maxPos` on every call — and with
-position, as attention reads more of the cache. A longer generation costs more per
-transaction from the very first one.
+Measured on Base Sepolia, not simulated. Those figures are for that run, not constants
+of the model: cost rises with position as attention reads more of the KV cache, so a
+longer generation costs more per transaction from the very first one.
 
 ## Why it takes many transactions
 
@@ -26,10 +25,16 @@ which on Base Sepolia is 1.2 **billion**. So the model can never be run by simpl
 it, however large blocks get. `eth_call` happily simulates at 1.19B gas, which makes the
 wall easy to miss until you send a real transaction.
 
-The fix is to make inference **resumable**. Each transaction runs one or more transformer
-layers and checkpoints the residual stream plus that layer's KV-cache row into contract
-storage; the next transaction reloads and continues. Total compute is unbounded while
-every individual transaction stays small.
+The fix is to make inference **resumable**, and to make the resumable unit small enough
+that nothing can outgrow a transaction. A layer is three phases — projections, attention
+one KV head at a time, then the feed-forward network in row-sized pieces — each of which
+checkpoints to storage so the next transaction can continue. A transaction runs as many
+phases as its gas allows, so the split costs nothing when there is room and rescues the
+run when there is not. Total compute is unbounded while every transaction stays small.
+
+The split is exact rather than approximate. Attention heads never interact, matmul output
+rows never interact, and what does accumulate does so by integer addition — so dividing
+the work reorders independent operations and cannot change a single bit of the result.
 
 ## Contracts
 
@@ -78,7 +83,8 @@ every layer is pinned to the one below it — and never to another implementatio
 - `matmul` with per-row shifts bit-identical to spec
 - first-position logits identical, argmax 407
 - full generation identical: `[432, 383, 286, 261, 376, 298, 315, 421]`
-- the resumable contract reproduces that same sequence across 72 transactions
+- the resumable contract reproduces that same sequence across 492 phases
+- row-sharded matmuls reproduce it again under a budget that forces every tensor to split
 
 ```bash
 forge test
@@ -130,11 +136,12 @@ compute. At 1B parameters a token needs on the order of 10,000 transactions, whi
 ~100 blocks of sequencer capacity with nothing else in them, after depositing gigabytes of
 weights across ~100,000 contracts.
 
-**Context length** is bounded by whichever phase stops fitting in one transaction. A layer
-splits into PREPARE / ATTEND / PROJECT, and only ATTEND grows with position — it divides
-by head, so the reachable position is set by one KV head's share of the cache rather than
-by a whole layer. Measured at 14M gas per transaction, that moved the wall from position
-48 to **167**; `test_FindStrandPosition` pins it.
+**Context length** is bounded by whichever phase stops fitting in one transaction. Only
+ATTEND grows with position, and it divides by head, so the reachable position is set by
+one KV head's share of the cache rather than by a whole layer. Measured at 14M gas per
+transaction, the wall moved from position 48 to **187**; `test_FindStrandPosition` pins it.
+What remains is the cold read of the KV cache itself, which is linear in position — the
+next step is splitting ATTEND over the KV range, in two passes so it stays exact.
 
 Note that the usual answer here — FlashAttention-style online softmax — is the wrong tool.
 Its rescaling exists to make attention single-pass, which is unnecessary when state is
@@ -142,11 +149,18 @@ already checkpointed between transactions, and the rescaling multiplications wou
 bit-exactness against the specification. Heads are independent and the KV range accumulates
 by integer addition, so both split *exactly*, with no rescaling at all.
 
-What binds past 167 is the weight read: every transaction materialises the whole 540KB
-blob (~780k gas, and ~556k of that is quadratic memory expansion). Reading only the slice
-a phase touches costs ~233k, which would free over 1M of headroom per transaction. That
-matters far more for larger models, where the blob grows but the slice a phase needs
-does not.
+**The split is not free.** Against the same generation the old whole-layer contract used
+256M gas in 72 transactions; the phase-split one uses ~405M in 52. Every phase reads its
+own weight slice and checkpoints its own state, and a small model never needed the split
+to begin with. What it buys is that nothing scales with model size any more: a phase reads
+one tensor's rows rather than the whole blob, and a matmul is however many row-sized pieces
+it needs to be. At 1.1B parameters a single feed-forward matmul is ~1.9B gas as one unit —
+136x any per-transaction ceiling — and the same code now runs it in pieces.
+
+Beware of measuring this the easy way. `test_ResumableMatchesSpec` runs without a gas cap,
+so the loop packs every phase into a handful of transactions and the per-transaction
+overhead disappears; it reported +6% where the chain reports +58%. Only the capped
+benchmark reflects what a real transaction pays.
 
 ## Licence and credits
 

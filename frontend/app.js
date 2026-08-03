@@ -12,7 +12,7 @@
 const E = window.ethers;
 const CHAIN_ID = 84532;
 const CHAIN_ID_HEX = "0x14a34";
-const DEFAULT_CONTRACT = "0x77D4fd6B1fcA991d586c75A94008441947B8Eb0b";
+const DEFAULT_CONTRACT = "0xc2ff49E48A5E7e2E472e6858610CF92BFbcD0e1C";
 const RPCS = ["https://sepolia.base.org", "https://base-sepolia-rpc.publicnode.com"];
 
 /* Model geometry is read from the contract, never assumed. It decides how many

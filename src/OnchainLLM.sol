@@ -42,6 +42,11 @@ contract OnchainLLM {
     bool public finished;
     uint256 public steps;
 
+    /// @notice Which phase of the current layer runs next: 0 PREPARE, 1 ATTEND, 2 PROJECT
+    uint256 public phase;
+    /// @notice Next attention head to run, while `phase` is ATTEND
+    uint256 public head;
+
     /// @dev Residual stream carried between layer steps (Q32)
     int256[] private _x;
 
@@ -52,6 +57,16 @@ contract OnchainLLM {
     ///      per-transaction gas cap.
     mapping(uint256 => uint256) private _kv;
     uint256 private constant PACK_N = 4;
+
+    /// @dev State that must survive between phases of one layer: the post-RoPE query,
+    ///      and the attention output as heads fill it in. Both are Q32 activations, so
+    ///      they pack four to a slot as int64 lanes exactly like the KV cache.
+    mapping(uint256 => uint256) private _scratch;
+    uint256 private constant SCRATCH_AO = 1 << 128;
+
+    /// @dev An ATTEND phase covers the query heads that share one KV head (nHeads/nKv
+    ///      under grouped-query attention). Splitting finer would make two phases read
+    ///      the same KV slice, and that read is the part that grows with position.
 
     event GenerationStarted(uint256 promptLen, uint256 maxPos);
     event StepRun(uint256 indexed pos, uint256 indexed layer, uint256 stepIndex);
@@ -104,6 +119,8 @@ contract OnchainLLM {
         maxPos = mp;
         pos = 0;
         layer = 0;
+        phase = 0;
+        head = 0;
         finished = false;
         steps = 0;
         _x = new int256[](c.dim);
@@ -152,33 +169,107 @@ contract OnchainLLM {
             return;
         }
 
-        uint256 estimate = 0;
+        if (lo == 0 && phase == 0 && head == 0) {
+            uint256 tok0 = p < promptIds.length ? promptIds[p] : generated[p - promptIds.length];
+            Transformer.embed(w, o, c, b, tok0);
+        }
+
+        // Guard on the most expensive phase seen so far, not the last one. Phases
+        // differ by an order of magnitude — an ATTEND costs a fraction of a PROJECT —
+        // so the previous phase's cost predicts nothing about the next, and estimating
+        // from it walks straight into a PROJECT with no gas left. The high-water mark
+        // packs slightly less per transaction and never strands a layer mid-flight.
+        //
+        // The measured cost also UNDER-estimates the next transaction: within one tx
+        // the KV slots are warm (100 gas) where a fresh tx re-reads them cold (2100),
+        // hence the additional margin.
+        uint256 worst = 0;
         uint256 ran = 0;
-        uint256 l = lo;
-        while (l < c.nLayers) {
+        bool residDirty = false;
+        while (layer < c.nLayers) {
             uint256 before = gasleft();
-            // The measured cost UNDER-estimates the next transaction: within one tx the
-            // KV slots are warm (100 gas), while a fresh tx re-reads them cold (2100).
-            // Keep a wide margin so an over-eager batch never reverts the whole step.
-            if (ran > 0 && before < estimate + estimate / 3 + reserve) break;
-            _loadKv(c, b, l, p);
-            uint256 token = p < promptIds.length ? promptIds[p] : generated[p - promptIds.length];
-            Transformer.forwardRange(w, o, c, b, token, p, l, l + 1);
-            _storeKv(c, b, l, p);
-            estimate = before - gasleft();
+            if (ran > 0 && before < worst + worst / 3 + reserve) break;
+            if (_phase(w, o, c, b, p)) residDirty = true;
+            uint256 cost = before - gasleft();
+            if (cost > worst) worst = cost;
             unchecked {
-                l += 1;
                 ran += 1;
             }
         }
 
-        for (uint256 i = 0; i < c.dim; ++i) {
-            xs[i] = b.resid[i];
+        // PREPARE and ATTEND leave the residual stream untouched, so it is only worth
+        // writing back when a PROJECT actually ran.
+        if (residDirty) {
+            for (uint256 i = 0; i < c.dim; ++i) {
+                xs[i] = b.resid[i];
+            }
+            _x = xs;
         }
-        _x = xs;
-        layer = l;
         steps += ran;
-        emit StepRun(p, l, steps);
+        emit StepRun(p, layer, steps);
+    }
+
+    /// @dev Run one phase of the current layer and advance the cursors.
+    ///      Returns true if the residual stream changed.
+    function _phase(
+        bytes memory w,
+        Transformer.Layout memory o,
+        Transformer.Config memory c,
+        Transformer.Buffers memory b,
+        uint256 p
+    ) private returns (bool residChanged) {
+        uint256 l = layer;
+        uint256 ph = phase;
+
+        if (ph == 0) {
+            Transformer.prepare(w, o, c, b, p, l);
+            _storeKvRow(c, b, l, p);
+            _saveVec(0, b.query, 0, c.dim);
+            phase = 1;
+            head = 0;
+            return false;
+        }
+
+        if (ph == 1) {
+            uint256 h0 = head;
+            uint256 h1 = h0 + c.nHeads / c.nKv;
+            if (h1 > c.nHeads) h1 = c.nHeads;
+            _loadVec(0, b.query, 0, c.dim);
+            // Only this head range's slice of the KV cache is touched, so only that
+            // slice is read back — the saving grows with position and is what keeps
+            // an ATTEND phase affordable deep into a sequence.
+            _loadKvHeads(c, b, l, p, h0, h1);
+            Transformer.attend(c, b, l, p, h0, h1);
+            _saveVec(SCRATCH_AO, b.attnOut, h0 * c.hs, (h1 - h0) * c.hs);
+            head = h1;
+            if (h1 == c.nHeads) phase = 2;
+            return false;
+        }
+
+        _loadVec(SCRATCH_AO, b.attnOut, 0, c.dim);
+        Transformer.project(w, o, c, b, l);
+        phase = 0;
+        head = 0;
+        layer = l + 1;
+        return true;
+    }
+
+    /// @dev Save `len` values of `src` from `off`, packed four int64 lanes per slot.
+    ///      `off` and `len` are multiples of PACK_N for every caller here (head slices
+    ///      are `hs` wide, and `hs` is a multiple of four).
+    function _saveVec(uint256 space, int256[] memory src, uint256 off, uint256 len) private {
+        for (uint256 i = 0; i < len; i += PACK_N) {
+            _scratch[space + (off + i) / PACK_N] = _pack(src, off + i, PACK_N);
+        }
+    }
+
+    function _loadVec(uint256 space, int256[] memory dst, uint256 off, uint256 len) private view {
+        for (uint256 i = 0; i < len; i += PACK_N) {
+            uint256 packed = _scratch[space + (off + i) / PACK_N];
+            for (uint256 j = 0; j < PACK_N; ++j) {
+                dst[off + i + j] = _lane(packed, j);
+            }
+        }
     }
 
     /// @dev Pick the next token (or teacher-force from the prompt) and advance
@@ -274,15 +365,29 @@ contract OnchainLLM {
         return int256(int64(uint64(packed >> (64 * j))));
     }
 
-    function _loadKv(Transformer.Config memory c, Transformer.Buffers memory b, uint256 l, uint256 p) private view {
+    /// @dev Load the KV rows that heads [h0, h1) will read, for every position up to and
+    ///      including `p`. Grouped-query attention means head h reads kv head h/kvMul, so
+    ///      a head range maps to a contiguous slice of each row rather than the whole of
+    ///      it. Reading only that slice is what stops the per-transaction cost of ATTEND
+    ///      from growing with the full kv width as the sequence lengthens.
+    function _loadKvHeads(
+        Transformer.Config memory c,
+        Transformer.Buffers memory b,
+        uint256 l,
+        uint256 p,
+        uint256 h0,
+        uint256 h1
+    ) private view {
+        uint256 kvMul = c.nHeads / c.nKv;
+        uint256 lo = (h0 / kvMul) * c.hs;
+        uint256 hi = ((h1 - 1) / kvMul + 1) * c.hs;
         uint256 kvd = c.kvd;
-        for (uint256 t = 0; t < p; ++t) {
+        for (uint256 t = 0; t <= p; ++t) {
             uint256 row = (Transformer.slotOf(b, l) * b.maxPos + t) * kvd;
-            for (uint256 i = 0; i < kvd; i += PACK_N) {
+            for (uint256 i = lo; i < hi; i += PACK_N) {
                 uint256 ks = _kv[_key(c, false, l, t, i / PACK_N)];
                 uint256 vs = _kv[_key(c, true, l, t, i / PACK_N)];
-                uint256 n = kvd - i < PACK_N ? kvd - i : PACK_N;
-                for (uint256 j = 0; j < n; ++j) {
+                for (uint256 j = 0; j < PACK_N; ++j) {
                     b.keyCache[row + i + j] = _lane(ks, j);
                     b.valueCache[row + i + j] = _lane(vs, j);
                 }
@@ -290,13 +395,12 @@ contract OnchainLLM {
         }
     }
 
-    function _storeKv(Transformer.Config memory c, Transformer.Buffers memory b, uint256 l, uint256 p) private {
+    function _storeKvRow(Transformer.Config memory c, Transformer.Buffers memory b, uint256 l, uint256 p) private {
         uint256 kvd = c.kvd;
-        uint256 row = (Transformer.slotOf(b, l) * b.maxPos + p) * kvd;
         for (uint256 i = 0; i < kvd; i += PACK_N) {
             uint256 n = kvd - i < PACK_N ? kvd - i : PACK_N;
-            _kv[_key(c, false, l, p, i / PACK_N)] = _pack(b.keyCache, row + i, n);
-            _kv[_key(c, true, l, p, i / PACK_N)] = _pack(b.valueCache, row + i, n);
+            _kv[_key(c, false, l, p, i / PACK_N)] = _pack(b.key, i, n);
+            _kv[_key(c, true, l, p, i / PACK_N)] = _pack(b.value, i, n);
         }
     }
 }

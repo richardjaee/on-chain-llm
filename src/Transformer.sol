@@ -319,8 +319,72 @@ library Transformer {
         }
     }
 
-    /// @notice Run layers [lo, hi) for one position. Splitting is safe because the
-    ///         residual stream and KV cache fully describe the state between layers.
+    /* A layer splits into three phases at points where the live state is small enough
+     * to checkpoint. Only the middle one grows with position, and it divides again by
+     * head, which is what keeps any single transaction bounded as context grows.
+     *
+     *   PREPARE   norm, Q/K/V, RoPE           flat in position
+     *   ATTEND    heads [h0, h1)              grows with position, splits by head
+     *   PROJECT   W_o, residual, SwiGLU FFN   flat in position
+     *
+     * Heads never interact: each reads its own query slice and its own KV head, and
+     * writes its own slice of attnOut. Splitting them is a reordering of independent
+     * work, not an approximation, so it cannot change a single bit of the result. */
+
+    /// @notice PREPARE: everything a layer does before attention
+    function prepare(bytes memory w, Layout memory o, Config memory c, Buffers memory b, uint256 pos, uint256 l)
+        internal
+        pure
+    {
+        uint256 dim = c.dim;
+        rmsnorm(w, o.rmsAtt, l * dim, b.resid, b.normed, dim);
+        matmul(w, o.wq, uint256(c.nLayers) * dim, l * dim, dim, dim, b.normed, b.query, 0);
+        matmul(w, o.wk, uint256(c.nLayers) * c.kvd, l * c.kvd, c.kvd, dim, b.normed, b.key, 0);
+        matmul(w, o.wv, uint256(c.nLayers) * c.kvd, l * c.kvd, c.kvd, dim, b.normed, b.value, 0);
+        rope(w, o, c, b.query, c.nHeads, pos);
+        rope(w, o, c, b.key, c.nKv, pos);
+    }
+
+    /// @notice Write this position's key and value into the in-memory cache
+    function cacheKv(Config memory c, Buffers memory b, uint256 l, uint256 pos) internal pure {
+        uint256 row = (slotOf(b, l) * b.maxPos + pos) * c.kvd;
+        for (uint256 i = 0; i < c.kvd; ++i) {
+            b.keyCache[row + i] = b.key[i];
+            b.valueCache[row + i] = b.value[i];
+        }
+    }
+
+    /// @notice ATTEND: heads [h0, h1) for one layer, into their slices of attnOut
+    function attend(Config memory c, Buffers memory b, uint256 l, uint256 pos, uint256 h0, uint256 h1) internal pure {
+        uint256 kvMul = c.nHeads / c.nKv;
+        uint256 base = slotOf(b, l) * b.maxPos * c.kvd;
+        for (uint256 h = h0; h < h1; ++h) {
+            _head(c, b, base, h * c.hs, (h / kvMul) * c.hs, pos + 1);
+        }
+    }
+
+    /// @notice PROJECT: output projection, residual, and the feed-forward network
+    function project(bytes memory w, Layout memory o, Config memory c, Buffers memory b, uint256 l) internal pure {
+        uint256 dim = c.dim;
+        matmul(w, o.wo, uint256(c.nLayers) * dim, l * dim, dim, dim, b.attnOut, b.proj, 0);
+        for (uint256 i = 0; i < dim; ++i) {
+            b.resid[i] += b.proj[i];
+        }
+
+        rmsnorm(w, o.rmsFfn, l * dim, b.resid, b.normed, dim);
+        matmul(w, o.w1, uint256(c.nLayers) * c.hidden, l * c.hidden, c.hidden, dim, b.normed, b.gate, 0);
+        matmul(w, o.w3, uint256(c.nLayers) * c.hidden, l * c.hidden, c.hidden, dim, b.normed, b.up, 0);
+        for (uint256 i = 0; i < c.hidden; ++i) {
+            b.gate[i] = (FixedPoint.silu(b.gate[i]) * b.up[i]) >> FixedPoint.F;
+        }
+        matmul(w, o.w2, uint256(c.nLayers) * dim, l * dim, dim, c.hidden, b.gate, b.proj, 0);
+        for (uint256 i = 0; i < dim; ++i) {
+            b.resid[i] += b.proj[i];
+        }
+    }
+
+    /// @notice Run layers [lo, hi) for one position, all phases in sequence. This is the
+    ///         whole-pass path; the resumable contract calls the phases individually.
     function forwardRange(
         bytes memory w,
         Layout memory o,
@@ -331,42 +395,12 @@ library Transformer {
         uint256 lo,
         uint256 hi
     ) internal pure {
-        uint256 dim = c.dim;
         if (lo == 0) embed(w, o, c, b, token);
-
         for (uint256 l = lo; l < hi; ++l) {
-            rmsnorm(w, o.rmsAtt, l * dim, b.resid, b.normed, dim);
-            matmul(w, o.wq, uint256(c.nLayers) * dim, l * dim, dim, dim, b.normed, b.query, 0);
-            matmul(w, o.wk, uint256(c.nLayers) * c.kvd, l * c.kvd, c.kvd, dim, b.normed, b.key, 0);
-            matmul(w, o.wv, uint256(c.nLayers) * c.kvd, l * c.kvd, c.kvd, dim, b.normed, b.value, 0);
-            rope(w, o, c, b.query, c.nHeads, pos);
-            rope(w, o, c, b.key, c.nKv, pos);
-
-            uint256 row = (slotOf(b, l) * b.maxPos + pos) * c.kvd;
-            for (uint256 i = 0; i < c.kvd; ++i) {
-                b.keyCache[row + i] = b.key[i];
-                b.valueCache[row + i] = b.value[i];
-            }
-
-            uint256 kvMul = c.nHeads / c.nKv;
-            for (uint256 h = 0; h < c.nHeads; ++h) {
-                _head(c, b, slotOf(b, l) * b.maxPos * c.kvd, h * c.hs, (h / kvMul) * c.hs, pos + 1);
-            }
-            matmul(w, o.wo, uint256(c.nLayers) * dim, l * dim, dim, dim, b.attnOut, b.proj, 0);
-            for (uint256 i = 0; i < dim; ++i) {
-                b.resid[i] += b.proj[i];
-            }
-
-            rmsnorm(w, o.rmsFfn, l * dim, b.resid, b.normed, dim);
-            matmul(w, o.w1, uint256(c.nLayers) * c.hidden, l * c.hidden, c.hidden, dim, b.normed, b.gate, 0);
-            matmul(w, o.w3, uint256(c.nLayers) * c.hidden, l * c.hidden, c.hidden, dim, b.normed, b.up, 0);
-            for (uint256 i = 0; i < c.hidden; ++i) {
-                b.gate[i] = (FixedPoint.silu(b.gate[i]) * b.up[i]) >> FixedPoint.F;
-            }
-            matmul(w, o.w2, uint256(c.nLayers) * dim, l * dim, dim, c.hidden, b.gate, b.proj, 0);
-            for (uint256 i = 0; i < dim; ++i) {
-                b.resid[i] += b.proj[i];
-            }
+            prepare(w, o, c, b, pos, l);
+            cacheKv(c, b, l, pos);
+            attend(c, b, l, pos, 0, c.nHeads);
+            project(w, o, c, b, l);
         }
     }
 

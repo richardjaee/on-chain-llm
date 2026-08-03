@@ -135,17 +135,17 @@ contract ProfileTest is Test {
         prompt[2] = 327;
         prompt[3] = 261;
         prompt[4] = 276;
-        llm.start(prompt, 120);
+        llm.start(prompt, 400);
 
         uint256 lastPos;
-        for (uint256 i = 0; i < 2000; ++i) {
+        for (uint256 i = 0; i < 60000; ++i) {
             (uint256 p,,, bool done,) = llm.progress();
             if (done) break;
             uint256 g = gasleft();
             try llm.step{gas: 14_000_000}(400_000) {
                 uint256 used = g - gasleft();
                 if (p != lastPos) {
-                    console2.log("pos", p, "step gas", used);
+                    if (p % 50 == 0) console2.log("pos", p, "step gas", used);
                     lastPos = p;
                 }
             } catch {

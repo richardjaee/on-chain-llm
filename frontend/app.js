@@ -12,7 +12,7 @@
 const E = window.ethers;
 const CHAIN_ID = 84532;
 const CHAIN_ID_HEX = "0x14a34";
-const DEFAULT_CONTRACT = "0x676ef269b1FE68129cE7d8001349d6802B9E339e";
+const DEFAULT_CONTRACT = "0x676Ef269b1Fe68129cE7D8001349d6802b9E339e";
 const RPCS = ["https://sepolia.base.org", "https://base-sepolia-rpc.publicnode.com"];
 
 /* Model geometry is read from the contract, never assumed. It decides how many
@@ -484,16 +484,20 @@ async function generate() {
   if (running) return;
   const text = $("prompt").value.trim();
   if (!text) { status("Type a prompt first.", "bad"); return; }
-  await loadGeom();
-  const ids = tok.encode(text);
-  const maxNew = parseInt($("maxnew").value, 10);
-  const txCount = (ids.length + maxNew) * geom.phasesPerPos;
 
   running = true; cancel = false; sessionGas = 0n; sessionTx = 0;
   $("go").disabled = true; $("stop").disabled = false;
   feedReset();
   try {
     ownRun = true;
+    // Reading the geometry and choosing a tokenizer belong inside the handler: they
+    // touch the network and the contract address, so they can fail, and a failure
+    // outside it leaves the button looking dead with nothing written anywhere.
+    status("Reading model geometry…", "busy");
+    await loadGeom();
+    const ids = tok.encode(text);
+    const maxNew = parseInt($("maxnew").value, 10);
+    const txCount = (ids.length + maxNew) * geom.phasesPerPos;
     rememberPrompt(text);
     $("carry").textContent = "";
     $("storyPrompt").textContent = text;

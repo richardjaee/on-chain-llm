@@ -8,8 +8,8 @@ Live on Base Sepolia, two deployments:
 
 | model | parameters | weights | address |
 |---|---|---|---|
-| **stories15M** | 15.19M | 30.5 MB, 1241 chunks | [`0x676ef269…39e`](https://sepolia.basescan.org/address/0x676ef269b1FE68129cE7d8001349d6802B9E339e) |
-| stories260K | 0.28M | 0.6 MB, 22 chunks | [`0xc2ff49E4…e1C`](https://sepolia.basescan.org/address/0xc2ff49E48A5E7e2E472e6858610CF92BFbcD0e1C) |
+| **stories15M** | 15.19M | 30.5 MB, 1241 chunks | [`0x676ef269…39e`](https://sepolia.basescan.org/address/0x676Ef269b1Fe68129cE7D8001349d6802b9E339e) |
+| stories260K | 0.28M | 0.6 MB, 22 chunks | [`0xc2ff49E4…e1C`](https://sepolia.basescan.org/address/0xc2ff49e48a5E7e2e472e6858610cF92BFbcd0e1C) |
 
 ```
 Once upon a time, there was a little girl

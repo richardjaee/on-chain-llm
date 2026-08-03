@@ -301,19 +301,20 @@ async function ensureFunded(txCount) {
  * loses its gas but no work — the next one in the batch performs that step instead.
  * Running past the end reverts with AlreadyFinished before touching anything.
  *
- * Measured against an anvil fork of Base Sepolia at its real 2s block time, one
- * 6-token generation, identical output every time:
+ * Measured on Base Sepolia itself, one 6-token generation, identical output:
  *
- *     serial     219.5s    48 tx   110 blocks
- *     batch 12    18.9s    47 tx    10 blocks
- *     batch 24    10.5s    47 tx     5 blocks
- *     batch 48     6.3s    47 tx     3 blocks
- *     batch 96     8.8s    47 tx     4 blocks   <- submission cost exceeds the saving
+ *     serialised   249.2s    48 tx   124 blocks
+ *     batch 32      21.3s    47 tx    10 blocks
  *
- * 32 rather than 48 because nodes cap how many transactions they queue per sender
- * (geth allows 16 executable and 64 queued by default) and anvil does not. Exceeding
- * that is harmless — the fill loop below keeps whatever was accepted and moves on —
- * so this is tuned to sit inside the common limit rather than to probe for it. */
+ * Base accepts 32 queued transactions from a session key without complaint. It will
+ * not do so from an EIP-7702 delegated account — a smart wallet — which is capped at
+ * one in flight and rejects the rest with "in-flight transaction limit reached for
+ * delegated accounts". Batching from such an account degrades to the serialised row
+ * above and nothing else breaks, but it is why the steps must come from the session
+ * key rather than from the user's own wallet.
+ *
+ * Providers differ in how deep a queue they hold, so exceeding the limit has to be
+ * survivable: the fill loop keeps whatever was accepted and moves on. */
 const BATCH = 32;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -351,10 +352,16 @@ async function runSteps() {
       ? { maxFeePerGas: fee.maxFeePerGas, maxPriorityFeePerGas: fee.maxPriorityFeePerGas ?? 0n }
       : {};
 
+    // Never queue more steps than the run can still use. Overshoot is harmless — the
+    // extra transactions revert with AlreadyFinished before touching state — but each
+    // one still pays intrinsic gas, and a full batch of them is pure waste.
+    const left = Math.max(1, (live.maxPos - live.pos) * (N_LAYERS + 1) - live.layer);
+    const want = Math.min(BATCH, left);
+
     // Fill the batch. Each call is only eth_sendRawTransaction — nothing is mined
     // yet, so these sit in the mempool in nonce order.
     const batch = [];
-    for (let i = 0; i < BATCH && !cancel; i++) {
+    for (let i = 0; i < want && !cancel; i++) {
       try {
         batch.push(await c.step(RESERVE, { gasLimit: STEP_GAS, nonce, ...price }));
         nonce++;

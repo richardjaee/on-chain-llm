@@ -105,16 +105,22 @@ the gas limit allows. This is safe because `step` is self-healing — it advance
 whatever `pos` and `layer` it finds in storage, so a transaction that reverts loses gas
 but no work, and the next one performs that step instead.
 
-Measured against an anvil fork of Base Sepolia at its real 2s block time, same generation,
-identical output:
+Measured on Base Sepolia itself, same generation, identical output:
 
 ```
-serial      194.3s   47 transactions   98 blocks
-batched      11.0s   47 transactions    5 blocks
+serialised   249.2s   48 transactions   124 blocks
+batched       21.3s   47 transactions    10 blocks
 ```
 
-Latency is bounded by blocks, not by transaction count, and one block holds about a
-hundred steps.
+Latency is bounded by blocks, not by transaction count, and a block holds far more than
+one step.
+
+There is a catch worth knowing, because it is invisible until you hit it. Base's sequencer
+allows **one in-flight transaction for EIP-7702 delegated accounts** — the kind you get
+from a smart wallet — rejecting anything further with `in-flight transaction limit reached
+for delegated accounts`. Batching from such an account silently degrades to the serialised
+row above. The session key sidesteps this because it is a freshly generated EOA with no
+delegation, which turns out to be a second reason the design needs one.
 
 ## Limits
 

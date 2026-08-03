@@ -117,19 +117,6 @@ def convert(path):
     return cfg, qw, shifts, cos_t, sin_t
 
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--out", default="model.json")
-    a = ap.parse_args()
-    cfg, qw, shifts, cos_t, sin_t = convert(a.model)
-    json.dump({"cfg": cfg, "shifts": shifts}, open(a.out, "w"))
-    print("config:", cfg)
-    for k in sorted(shifts):
-        s = shifts[k]
-        print(f"  {k:10} rows={len(s):>6}  shift min/max = {min(s)}/{max(s)}")
-
-
 # ---------------------------------------------------------------- blob layout
 # Ours, and deliberately simple so the Solidity can derive every offset from the
 # config alone. For each tensor, in this order:
@@ -165,3 +152,23 @@ def build_blob(cfg, qw, shifts, cos_t, sin_t):
         for v in row:
             out += struct.pack(">i", v)
     return bytes(out)
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--out", default="model.json")
+    ap.add_argument("--blob", help="write the on-chain blob here as hex")
+    a = ap.parse_args()
+    cfg, qw, shifts, cos_t, sin_t = convert(a.model)
+    json.dump({"cfg": cfg, "shifts": shifts}, open(a.out, "w"))
+    print("config:", cfg)
+    for k in sorted(shifts):
+        s = shifts[k]
+        print(f"  {k:10} rows={len(s):>6}  shift min/max = {min(s)}/{max(s)}")
+    if a.blob:
+        blob = build_blob(cfg, qw, shifts, cos_t, sin_t)
+        with open(a.blob, "w") as f:
+            f.write(blob.hex())
+        print(f"blob: {len(blob):,} bytes ({len(blob)/1e6:.2f} MB), "
+              f"{(len(blob) + 24574)//24575} chunks -> {a.blob}")

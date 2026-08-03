@@ -199,10 +199,18 @@ contract OnchainLLM {
             return;
         }
 
+        // Embedding a token writes the residual stream, so it has to be persisted like
+        // any other write to it. Only W_o and W_2 set this flag otherwise, and a
+        // transaction that embeds but ends before reaching one would throw the
+        // embedding away — the next transaction reloads zeros and, being past phase 0,
+        // never embeds again, so the whole position computes on an empty vector. Small
+        // models hid this: their first transaction always reached W_o.
+        bool residDirty = false;
         if (lo == 0 && phase == 0 && cursor == 0) {
             uint256 tok0 = p < promptIds.length ? promptIds[p] : generated[p - promptIds.length];
             (bytes memory ew, Transformer.Layout memory eo) = Transformer.sliceEmbed(chunks, o, c, tok0);
             Transformer.embed(ew, eo, c, b, 0, 1);
+            residDirty = true;
         }
 
         // Guard on the most expensive phase seen so far, not the last one. Phases
@@ -225,7 +233,6 @@ contract OnchainLLM {
         if (keep < floorGas) keep = floorGas;
 
         uint256 ran = 0;
-        bool residDirty = false;
         while (layer < c.nLayers) {
             uint256 before = gasleft();
             uint256 ph = phase;
@@ -592,6 +599,12 @@ contract OnchainLLM {
         bytes memory table = WeightStore.read(tokPtr);
         uint16[] memory ids = generated;
         return string(Decoder.decode(table, ids, ids.length, promptIds[promptIds.length - 1]));
+    }
+
+    /// @notice The residual stream as it currently stands, for comparing a partially
+    ///         advanced run against the reference implementation.
+    function residual() external view returns (int256[] memory) {
+        return _x;
     }
 
     function generatedIds() external view returns (uint16[] memory) {

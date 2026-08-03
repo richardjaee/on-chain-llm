@@ -12,7 +12,7 @@
 const E = window.ethers;
 const CHAIN_ID = 84532;
 const CHAIN_ID_HEX = "0x14a34";
-const DEFAULT_CONTRACT = "0xc2ff49E48A5E7e2E472e6858610CF92BFbcD0e1C";
+const DEFAULT_CONTRACT = "0x676ef269b1FE68129cE7d8001349d6802B9E339e";
 const RPCS = ["https://sepolia.base.org", "https://base-sepolia-rpc.publicnode.com"];
 
 /* Model geometry is read from the contract, never assumed. It decides how many
@@ -58,7 +58,11 @@ const SESSKEY = "onchain-llm-session-key";
 const lastPrompt = () => { try { return localStorage.getItem(PROMPT_KEY) || ""; } catch (e) { return ""; } };
 const rememberPrompt = (t) => { try { localStorage.setItem(PROMPT_KEY, t); } catch (e) {} };
 
-const tok = makeTok512(TOK512_SPEC);
+/* Which tokenizer applies is a property of the deployed model, not of this page, so
+ * it is chosen once the contract's vocabulary is known. tok512 is the default because
+ * it needs no fetch; anything larger loads the Llama vocabulary alongside. */
+let tok = makeTok512(TOK512_SPEC);
+let tokReady = false;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
@@ -103,6 +107,18 @@ async function loadGeom() {
       phasesPerPos: Number(per),
     };
   });
+  if (!tokReady) {
+    if (geom.vocab > 512) {
+      // A 32k vocabulary is ~178KB of strings; fetched rather than inlined so the page
+      // does not carry a table most deployments never use.
+      const res = await fetch("tokenizer-llama.bin");
+      if (!res.ok) throw new Error("tokenizer-llama.bin not found, needed for vocab " + geom.vocab);
+      tok = makeLlamaTok(await res.arrayBuffer());
+      if (tok.size < geom.vocab) throw new Error("tokenizer has " + tok.size + " tokens, model needs " + geom.vocab);
+    }
+    tokReady = true;
+    addTx({ kind: "tokenizer loaded", msg: `${tok.size} tokens, matching the contract's vocabulary`, cls: "note" });
+  }
   return geom;
 }
 
@@ -468,9 +484,9 @@ async function generate() {
   if (running) return;
   const text = $("prompt").value.trim();
   if (!text) { status("Type a prompt first.", "bad"); return; }
+  await loadGeom();
   const ids = tok.encode(text);
   const maxNew = parseInt($("maxnew").value, 10);
-  await loadGeom();
   const txCount = (ids.length + maxNew) * geom.phasesPerPos;
 
   running = true; cancel = false; sessionGas = 0n; sessionTx = 0;

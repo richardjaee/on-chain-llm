@@ -13,9 +13,13 @@ contract DeployScript is Script {
 
     function run() public {
         string memory root = vm.projectRoot();
-        bytes memory blob = vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/model.hex"))));
-        bytes memory table =
-            vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/tokens.hex"))));
+        // Which model to deploy is configuration, not code. Defaults reproduce the
+        // stories260K deployment; MODEL/TOKENS and the geometry variables point it at
+        // any checkpoint converted by tools/convert.py.
+        string memory mp = vm.envOr("MODEL", string.concat(root, "/artifacts/model.hex"));
+        string memory tp = vm.envOr("TOKENS", string.concat(root, "/artifacts/tokens.hex"));
+        bytes memory blob = vm.parseBytes(string.concat("0x", vm.readFile(mp)));
+        bytes memory table = vm.parseBytes(string.concat("0x", vm.readFile(tp)));
 
         vm.startBroadcast();
 
@@ -29,37 +33,43 @@ contract DeployScript is Script {
             uint256 s = i * WeightStore.MAX_PAYLOAD;
             uint256 len = blob.length - s;
             if (len > WeightStore.MAX_PAYLOAD) len = WeightStore.MAX_PAYLOAD;
-            dir = abi.encodePacked(dir, WeightStore.write(_slice(blob, s, len)));
+            page = abi.encodePacked(page, WeightStore.write(_slice(blob, s, len)));
+            if (page.length / 20 == WeightStore.PER_PAGE) {
+                dir = abi.encodePacked(dir, WeightStore.write(page));
+                page = "";
+            }
         }
         if (page.length > 0) dir = abi.encodePacked(dir, WeightStore.write(page));
 
         address dirPtr = WeightStore.write(dir);
 
-        llm = new OnchainLLM(
-            dirPtr,
-            Transformer.Config({
-                dim: 64,
-                hidden: 172,
-                nLayers: 5,
-                nHeads: 8,
-                nKv: 4,
-                vocab: 512,
-                seqLen: 512,
-                hs: 8,
-                kvd: 32,
-                shared: true,
-                invSqrtHs: 0
-            }),
-            0 // default MACs per sharded matmul phase
-        );
+        llm = new OnchainLLM(dirPtr, _config(), vm.envOr("MACS", uint256(0)));
 
         vm.stopBroadcast();
 
         console.log("token table :", tokPtr);
         console.log("weight chunks:", n);
+        console.log("pages       :", (n + WeightStore.PER_PAGE - 1) / WeightStore.PER_PAGE);
         console.log("directory   :", dirPtr);
         console.log("OnchainLLM  :", address(llm));
         console.log("DEPLOYED_TARGET=%s", address(llm));
+    }
+
+    /// @dev Fields are assigned one at a time rather than built as a single struct
+    ///      literal. Eleven simultaneous temporaries in one expression is enough to
+    ///      push this compilation unit past the reachable stack under via-ir.
+    function _config() internal view returns (Transformer.Config memory c) {
+        c.dim = uint32(vm.envOr("DIM", uint256(64)));
+        c.hidden = uint32(vm.envOr("HIDDEN", uint256(172)));
+        c.nLayers = uint32(vm.envOr("LAYERS", uint256(5)));
+        c.nHeads = uint32(vm.envOr("HEADS", uint256(8)));
+        c.nKv = uint32(vm.envOr("KVHEADS", uint256(4)));
+        c.vocab = uint32(vm.envOr("VOCAB", uint256(512)));
+        c.seqLen = uint32(vm.envOr("SEQLEN", uint256(512)));
+        c.hs = c.dim / c.nHeads;
+        c.kvd = c.hs * c.nKv;
+        c.shared = true;
+        c.invSqrtHs = 0;
     }
 
     function _slice(bytes memory d, uint256 s, uint256 len) internal pure returns (bytes memory out) {

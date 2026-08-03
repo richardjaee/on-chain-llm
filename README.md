@@ -4,18 +4,23 @@ A language model that runs **entirely inside Ethereum transactions** — no oper
 off-chain compute, no trusted anything. The prompt goes in as token ids and every
 multiply-accumulate executes as EVM opcodes.
 
-Live on Base Sepolia: [`0xc2ff49E48A5E7e2E472e6858610CF92BFbcD0e1C`](https://sepolia.basescan.org/address/0xc2ff49E48A5E7e2E472e6858610CF92BFbcD0e1C)
+Live on Base Sepolia, two deployments:
+
+| model | parameters | weights | address |
+|---|---|---|---|
+| **stories15M** | 15.19M | 30.5 MB, 1241 chunks | [`0x676ef269…39e`](https://sepolia.basescan.org/address/0x676ef269b1FE68129cE7d8001349d6802B9E339e) |
+| stories260K | 0.28M | 0.6 MB, 22 chunks | [`0xc2ff49E4…e1C`](https://sepolia.basescan.org/address/0xc2ff49E48A5E7e2E472e6858610CF92BFbcD0e1C) |
 
 ```
-prompt : Once upon a time          (5 tokens, maxNew = 8)
-output : , there was a little girl
+Once upon a time, there was a little girl
 
-52 transactions · 492 phases · ~405M gas · 12 blocks · 25 seconds
+stories15M · 6 tokens · 1001 transactions · 8.83B gas · 6.5 minutes
 ```
 
-Measured on Base Sepolia, not simulated. Those figures are for that run, not constants
-of the model: cost rises with position as attention reads more of the KV cache, so a
-longer generation costs more per transaction from the very first one.
+Measured on chain, not simulated, and identical token for token to the Python
+specification. Those figures are for that run, not constants of the model: cost rises
+with position as attention reads more of the KV cache, so a longer generation costs
+more per transaction from the very first one.
 
 ## Why it takes many transactions
 
@@ -46,8 +51,20 @@ the work reorders independent operations and cannot change a single bit of the r
 | `WeightStore.sol` | Weights as contract bytecode, with arbitrary-range streaming reads |
 | `Decoder.sol` | Token ids back to UTF-8 from an on-chain table |
 
-Weights live as contract bytecode across 22 data contracts (540 KB), read with
-`EXTCODECOPY`. Nothing is precomputed — contract storage holds no outputs.
+Weights live as contract bytecode — 22 data contracts for stories260K, 1241 for
+stories15M — read with `EXTCODECOPY`. Chunk addresses are themselves stored as data
+contracts (pages), because one directory holds at most 1228 of them, which would have
+capped any model at ~30 MB. Nothing is precomputed; contract storage holds no outputs.
+
+## Tools
+
+| | |
+|---|---|
+| `tools/convert.py` | checkpoint → quantised blob (`--blob`) |
+| `tools/toktable.py` | tokenizer → on-chain token table |
+| `tools/synth.py` | correctly shaped blobs at arbitrary width, for scaling experiments |
+| `tools/model.py`, `intref.py` | the integer specification everything is checked against |
+| `tools/llama2-reference.c` | llama2.c's `run.c`, vendored unmodified |
 
 ## Design decisions
 
@@ -85,6 +102,8 @@ every layer is pinned to the one below it — and never to another implementatio
 - full generation identical: `[432, 383, 286, 261, 376, 298, 315, 421]`
 - the resumable contract reproduces that same sequence across 492 phases
 - row-sharded matmuls reproduce it again under a budget that forces every tensor to split
+- stories15M, a real 15M-parameter checkpoint, matches the specification token for token
+  on chain — 12 tokens over 1727 transactions
 
 ```bash
 forge test
@@ -139,7 +158,7 @@ weights across ~100,000 contracts.
 **Context length** is bounded by whichever phase stops fitting in one transaction. Only
 ATTEND grows with position, and it divides by head, so the reachable position is set by
 one KV head's share of the cache rather than by a whole layer. Measured at 14M gas per
-transaction, the wall moved from position 48 to **187**; `test_FindStrandPosition` pins it.
+transaction, the wall moved from position 48 to **286**; `test_FindStrandPosition` pins it.
 What remains is the cold read of the KV cache itself, which is linear in position — the
 next step is splitting ATTEND over the KV range, in two passes so it stays exact.
 
@@ -148,6 +167,21 @@ Its rescaling exists to make attention single-pass, which is unnecessary when st
 already checkpointed between transactions, and the rescaling multiplications would break
 bit-exactness against the specification. Heads are independent and the KV range accumulates
 by integer addition, so both split *exactly*, with no rescaling at all.
+
+**Scaling.** Measured across four widths, gas is roughly linear in parameters — about
+59 gas per parameter per token at dim 256, rising to 96 at dim 2048 as per-phase
+overheads grow:
+
+```
+dim  256   1.58M params    83M gas/token
+dim  512   6.06M params   364M
+dim 1024   6.03M params   406M
+dim 2048  13.76M params  1317M     TinyLlama's width, runs under a 14M cap
+```
+
+Extrapolated, a 500M model is ~30B gas per token and ~2,500 transactions; a 1.1B model
+is ~65B and ~5,400. Neither is blocked by the architecture any more. Both are blocked by
+what it costs to put gigabytes of weights on a chain.
 
 **The split is not free.** Against the same generation the old whole-layer contract used
 256M gas in 72 transactions; the phase-split one uses ~405M in 52. Every phase reads its

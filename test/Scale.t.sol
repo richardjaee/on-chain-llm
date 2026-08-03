@@ -137,7 +137,9 @@ contract ScaleTest is Test {
     }
 
     function _slice20(bytes memory b, uint256 off) internal pure returns (bytes32 r) {
-        assembly ("memory-safe") { r := mload(add(add(b, 0x20), off)) }
+        assembly ("memory-safe") {
+            r := mload(add(add(b, 0x20), off))
+        }
     }
 
     /// @notice Whole-blob path only: does the library itself get the right first token?

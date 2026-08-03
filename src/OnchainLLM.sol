@@ -64,8 +64,13 @@ contract OnchainLLM {
     int256 private _bestVal;
     uint256 private _bestIdx;
 
-    /// @dev Residual stream carried between layer steps (Q32)
-    int256[] private _x;
+    /// @dev Residual stream carried between layer steps, packed four int64 lanes per
+    ///      slot like everything else that crosses a transaction. One slot per element
+    ///      costs `dim` fresh writes at 20,000 gas the first time — 11.5M at dim 576,
+    ///      which alone exceeded what was left of a transaction after a phase had run.
+    ///      Packing makes it a quarter of that, and Q32 activations already have to fit
+    ///      int64 for the KV cache, so nothing new is being assumed.
+    uint256 private constant SCRATCH_RESID = 4 << 128;
 
     /// @dev KV cache, four Q32 values packed per slot as int64 lanes.
     ///      Key: (isValue ? 1<<128 : 0) + ((layer * seqLen + pos) * slotsPerRow) + lane.
@@ -144,13 +149,20 @@ contract OnchainLLM {
         uint256 mp = ids.length + maxNew;
         if (mp > c.seqLen) mp = c.seqLen;
         maxPos = mp;
+        // Pay the residual stream's first-write cost here, once. A fresh storage slot
+        // costs 20,000 gas and an update 5,000, so leaving the slots zero makes the
+        // first `step` carry a spike four times the size of every later writeback —
+        // enough at dim 2048 to push a phase plus its writeback past a transaction.
+        // The values are irrelevant: position 0 always embeds, which overwrites them.
+        for (uint256 i = 0; i < c.dim; i += PACK_N) {
+            _scratch[SCRATCH_RESID + i / PACK_N] = 1;
+        }
         pos = 0;
         layer = 0;
         phase = 0;
         cursor = 0;
         finished = false;
         steps = 0;
-        _x = new int256[](c.dim);
         emit GenerationStarted(ids.length, mp);
     }
 
@@ -181,10 +193,7 @@ contract OnchainLLM {
         Transformer.Buffers memory b = lo == c.nLayers
             ? Transformer.newBuffers(c, 1, 1, Transformer.rowsPerPhase(macsPerPhase, c.dim, c.vocab))
             : Transformer.newBuffers(c, p + 1, 1, 1);
-        int256[] memory xs = _x;
-        for (uint256 i = 0; i < c.dim; ++i) {
-            b.resid[i] = xs[i];
-        }
+        _loadVec(SCRATCH_RESID, b.resid, 0, c.dim);
 
         if (lo == c.nLayers) {
             // Inside the prompt the next token is already known, so the classifier is
@@ -229,7 +238,7 @@ contract OnchainLLM {
         // runs out after the loop has already decided it had room. The floor is
         // derived from the model rather than trusted from the caller.
         uint256 keep = reserve;
-        uint256 floorGas = uint256(c.dim) * 22_000;
+        uint256 floorGas = uint256(c.dim) * 1_800;
         if (keep < floorGas) keep = floorGas;
 
         uint256 ran = 0;
@@ -252,12 +261,7 @@ contract OnchainLLM {
 
         // PREPARE and ATTEND leave the residual stream untouched, so it is only worth
         // writing back when a PROJECT actually ran.
-        if (residDirty) {
-            for (uint256 i = 0; i < c.dim; ++i) {
-                xs[i] = b.resid[i];
-            }
-            _x = xs;
-        }
+        if (residDirty) _saveVec(SCRATCH_RESID, b.resid, 0, c.dim);
         steps += ran;
         emit StepRun(p, layer, steps, phase);
     }
@@ -616,8 +620,16 @@ contract OnchainLLM {
 
     /// @notice The residual stream as it currently stands, for comparing a partially
     ///         advanced run against the reference implementation.
-    function residual() external view returns (int256[] memory) {
-        return _x;
+    function residual() external view returns (int256[] memory r) {
+        uint256 dim = _dim;
+        r = new int256[](dim);
+        for (uint256 i = 0; i < dim; i += PACK_N) {
+            uint256 packed = _scratch[SCRATCH_RESID + i / PACK_N];
+            uint256 n = dim - i < PACK_N ? dim - i : PACK_N;
+            for (uint256 j = 0; j < n; ++j) {
+                r[i + j] = _lane(packed, j);
+            }
+        }
     }
 
     function generatedIds() external view returns (uint16[] memory) {
@@ -680,27 +692,13 @@ contract OnchainLLM {
     ///      word of memory per chunk: negligible at thousands of chunks, and the
     ///      dominant per-transaction cost in the tens of thousands, which is where the
     ///      next change would be needed.
-    function _dir() private view returns (address tokPtr, address[] memory chunks) {
+    function _dir() private view returns (address tokPtr, address[] memory pages) {
         bytes memory d = WeightStore.read(directory);
         uint256 np = d.length / 20 - 1;
         tokPtr = _addr(d, 0);
-
-        bytes[] memory raw = new bytes[](np);
-        uint256 total = 0;
+        pages = new address[](np);
         for (uint256 i = 0; i < np; ++i) {
-            raw[i] = WeightStore.read(_addr(d, (i + 1) * 20));
-            total += raw[i].length / 20;
-        }
-        chunks = new address[](total);
-        uint256 k = 0;
-        for (uint256 i = 0; i < np; ++i) {
-            uint256 m = raw[i].length / 20;
-            for (uint256 j = 0; j < m; ++j) {
-                chunks[k] = _addr(raw[i], j * 20);
-                unchecked {
-                    k += 1;
-                }
-            }
+            pages[i] = _addr(d, (i + 1) * 20);
         }
     }
 

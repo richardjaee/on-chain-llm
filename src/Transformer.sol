@@ -428,8 +428,8 @@ library Transformer {
         uint256 n,
         uint256 cols
     ) private view returns (uint256) {
-        WeightStore.readRangeAt(pages, base + r0, n, dest, at);
-        WeightStore.readRangeAt(pages, base + rowsTotal + r0 * cols * 2, n * cols * 2, dest, at + n);
+        WeightStore.readRangePagedAt(pages, base + r0, n, dest, at);
+        WeightStore.readRangePagedAt(pages, base + rowsTotal + r0 * cols * 2, n * cols * 2, dest, at + n);
         return n + n * cols * 2;
     }
 
@@ -453,8 +453,8 @@ library Transformer {
         uint256 at = 0;
 
         // rms_att is a single-row block: shift byte, then this layer's slice of gains
-        WeightStore.readRangeAt(pages, o.rmsAtt, 1, data, at);
-        WeightStore.readRangeAt(pages, o.rmsAtt + 1 + l * dim * 2, dim * 2, data, at + 1);
+        WeightStore.readRangePagedAt(pages, o.rmsAtt, 1, data, at);
+        WeightStore.readRangePagedAt(pages, o.rmsAtt + 1 + l * dim * 2, dim * 2, data, at + 1);
         s.rmsAtt = at;
         at += 1 + dim * 2;
 
@@ -467,10 +467,10 @@ library Transformer {
 
         // Only this position's RoPE row, so the caller passes pos = 0
         s.ropeCos = at;
-        WeightStore.readRangeAt(pages, o.ropeCos + pos * half * 4, half * 4, data, at);
+        WeightStore.readRangePagedAt(pages, o.ropeCos + pos * half * 4, half * 4, data, at);
         at += half * 4;
         s.ropeSin = at;
-        WeightStore.readRangeAt(pages, o.ropeSin + pos * half * 4, half * 4, data, at);
+        WeightStore.readRangePagedAt(pages, o.ropeSin + pos * half * 4, half * 4, data, at);
     }
 
     /// @notice Weights for one PROJECT: W_o, rms_ffn, and W_1/W_2/W_3 for layer `l`
@@ -488,8 +488,8 @@ library Transformer {
         s.wo = at;
         at += _sliceRows(pages, data, at, o.wo, uint256(c.nLayers) * dim, l * dim, dim, dim);
 
-        WeightStore.readRangeAt(pages, o.rmsFfn, 1, data, at);
-        WeightStore.readRangeAt(pages, o.rmsFfn + 1 + l * dim * 2, dim * 2, data, at + 1);
+        WeightStore.readRangePagedAt(pages, o.rmsFfn, 1, data, at);
+        WeightStore.readRangePagedAt(pages, o.rmsFfn + 1 + l * dim * 2, dim * 2, data, at + 1);
         s.rmsFfn = at;
         at += 1 + dim * 2;
 
@@ -520,7 +520,7 @@ library Transformer {
     {
         data = new bytes(1 + c.dim * 2 + SLICE_PAD);
         s.rmsFinal = 0;
-        WeightStore.readRangeAt(pages, o.rmsFinal, 1 + c.dim * 2, data, 0);
+        WeightStore.readRangePagedAt(pages, o.rmsFinal, 1 + c.dim * 2, data, 0);
     }
 
     /// @notice Weights for the classifier: final RMSNorm gains and the whole W_cls
@@ -532,7 +532,7 @@ library Transformer {
         uint256 n = 1 + c.dim * 2 + blockSize(c.vocab, c.dim);
         data = new bytes(n + SLICE_PAD);
         s.rmsFinal = 0;
-        WeightStore.readRangeAt(pages, o.rmsFinal, 1 + c.dim * 2, data, 0);
+        WeightStore.readRangePagedAt(pages, o.rmsFinal, 1 + c.dim * 2, data, 0);
         s.wcls = 1 + c.dim * 2;
         _sliceRows(pages, data, s.wcls, o.wcls, c.vocab, 0, c.vocab, c.dim);
     }
@@ -577,8 +577,8 @@ library Transformer {
     {
         data = new bytes(1 + c.dim * 2 + SLICE_PAD);
         s.rmsAtt = 0;
-        WeightStore.readRangeAt(pages, o.rmsAtt, 1, data, 0);
-        WeightStore.readRangeAt(pages, o.rmsAtt + 1 + l * c.dim * 2, c.dim * 2, data, 1);
+        WeightStore.readRangePagedAt(pages, o.rmsAtt, 1, data, 0);
+        WeightStore.readRangePagedAt(pages, o.rmsAtt + 1 + l * c.dim * 2, c.dim * 2, data, 1);
     }
 
     /// @notice W_q rows [r0, r0+n) plus this position's RoPE row
@@ -597,9 +597,9 @@ library Transformer {
         s.wq = 0;
         _sliceRows(pages, data, 0, o.wq, uint256(c.nLayers) * c.dim, l * c.dim + r0, n, c.dim);
         s.ropeCos = body;
-        WeightStore.readRangeAt(pages, o.ropeCos + pos * half * 4, half * 4, data, body);
+        WeightStore.readRangePagedAt(pages, o.ropeCos + pos * half * 4, half * 4, data, body);
         s.ropeSin = body + half * 4;
-        WeightStore.readRangeAt(pages, o.ropeSin + pos * half * 4, half * 4, data, body + half * 4);
+        WeightStore.readRangePagedAt(pages, o.ropeSin + pos * half * 4, half * 4, data, body + half * 4);
     }
 
     /// @notice W_k and W_v rows [r0, r0+n) plus this position's RoPE row
@@ -620,9 +620,9 @@ library Transformer {
         s.wv = one;
         _sliceRows(pages, data, one, o.wv, uint256(c.nLayers) * c.kvd, l * c.kvd + r0, n, c.dim);
         s.ropeCos = one * 2;
-        WeightStore.readRangeAt(pages, o.ropeCos + pos * half * 4, half * 4, data, one * 2);
+        WeightStore.readRangePagedAt(pages, o.ropeCos + pos * half * 4, half * 4, data, one * 2);
         s.ropeSin = one * 2 + half * 4;
-        WeightStore.readRangeAt(pages, o.ropeSin + pos * half * 4, half * 4, data, one * 2 + half * 4);
+        WeightStore.readRangePagedAt(pages, o.ropeSin + pos * half * 4, half * 4, data, one * 2 + half * 4);
     }
 
     /// @notice One Q shard: rows [r0, r0+n) of W_q, rotated in place
@@ -780,8 +780,8 @@ library Transformer {
     {
         data = new bytes(1 + c.dim * 2 + SLICE_PAD);
         s.rmsFfn = 0;
-        WeightStore.readRangeAt(pages, o.rmsFfn, 1, data, 0);
-        WeightStore.readRangeAt(pages, o.rmsFfn + 1 + l * c.dim * 2, c.dim * 2, data, 1);
+        WeightStore.readRangePagedAt(pages, o.rmsFfn, 1, data, 0);
+        WeightStore.readRangePagedAt(pages, o.rmsFfn + 1 + l * c.dim * 2, c.dim * 2, data, 1);
     }
 
     /// @notice PROJECT: output projection, residual, and the feed-forward network

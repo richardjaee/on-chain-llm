@@ -50,9 +50,10 @@ const iface = new E.Interface(ABI);
 const STEP_GAS = 14_000_000n, RESERVE = 400_000n;
 
 /* `start` allocates the residual stream, which is one storage slot per dimension, so
- * its cost scales with the model: ~1.6M gas at dim 64 and ~5.8M at dim 288. A fixed
- * 3M was fine for the first model and silently too small for the second. */
-const startGas = () => 800_000n + BigInt(geom ? geom.dim : 64) * 25_000n;
+ * its cost scales with the model — it also pre-writes those slots so no later step
+ * carries a fresh-slot spike. A fixed 3M was fine for the first model and silently
+ * too small for the second. */
+const startGas = () => 600_000n + BigInt(geom ? geom.dim : 64) * 7_000n;
 
 /* Rough gas for one phase, from the model's width. Phases are bounded by the MAC
  * budget, but the fixed part of one — slice reads, checkpoints, the norm recompute —

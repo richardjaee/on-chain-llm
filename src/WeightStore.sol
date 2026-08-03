@@ -79,6 +79,50 @@ library WeightStore {
         readRangeAt(chunks, offset, len, dest, 0);
     }
 
+    /// @notice As `readRangeAt`, but resolving each chunk from its page on demand.
+    /// @dev The alternative — expanding every chunk address into memory once per
+    ///      transaction — costs about 420 gas per chunk whether or not it is read:
+    ///      470k at 1,241 chunks, 4.6M at 10,959, and more than a whole transaction
+    ///      at the 40,000 a 500M model needs. A byte range spans a contiguous run of
+    ///      chunks, so resolving them as the copy walks turns a cost proportional to
+    ///      the model into one proportional to the read.
+    function readRangePagedAt(address[] memory pages, uint256 offset, uint256 len, bytes memory dest, uint256 destOff)
+        internal
+        view
+    {
+        if (destOff + len > dest.length) revert OutOfRange();
+        while (len > 0) {
+            uint256 take = MAX_PAYLOAD - (offset % MAX_PAYLOAD);
+            if (take > len) take = len;
+            _copyPaged(pages, offset / MAX_PAYLOAD, offset % MAX_PAYLOAD, take, dest, destOff);
+            unchecked {
+                offset += take;
+                destOff += take;
+                len -= take;
+            }
+        }
+    }
+
+    /// @dev Page lookup and payload copy in one frame. Splitting them costs a live
+    ///      local in the loop above, and this whole path is inlined into the phase
+    ///      functions, where the stack is already the binding constraint.
+    function _copyPaged(
+        address[] memory pages,
+        uint256 ci,
+        uint256 within,
+        uint256 take,
+        bytes memory dest,
+        uint256 destOff
+    ) private view {
+        address page = pages[ci / PER_PAGE];
+        uint256 poff = (ci % PER_PAGE) * 20 + 1; // +1 skips the STOP prefix
+        assembly ("memory-safe") {
+            mstore(0x00, 0)
+            extcodecopy(page, 0x00, poff, 20)
+            extcodecopy(shr(96, mload(0x00)), add(add(dest, 0x20), destOff), add(1, within), take)
+        }
+    }
+
     /// @notice As `readRange`, but writing into `dest` starting at `destOff`
     /// @dev Assembling a slice means copying several disjoint ranges of the logical blob
     ///      into one buffer, so the destination cursor has to move independently of the

@@ -17,6 +17,14 @@ library WeightStore {
     /// @notice Max payload per chunk: EIP-170's 24,576 limit minus the STOP prefix
     uint256 internal constant MAX_PAYLOAD = 24_575;
 
+    /// @notice Chunk addresses that fit in one page contract
+    /// @dev A directory is itself a data contract, so listing chunks directly in one
+    ///      caps the model at MAX_PAYLOAD / 20 = 1228 chunks — about 30MB of weights,
+    ///      or 15M int16 parameters. That ceiling has nothing to do with compute and no
+    ///      amount of sharding moves it. A directory of pages raises it to 1228 x 1228
+    ///      chunks, roughly 37GB, which is past anything worth deploying.
+    uint256 internal constant PER_PAGE = MAX_PAYLOAD / 20;
+
     error PayloadTooLarge();
     error DeployFailed();
     error OutOfRange();

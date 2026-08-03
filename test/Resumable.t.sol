@@ -31,6 +31,9 @@ contract ResumableTest is Test {
             vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/tokens.hex"))));
         address tokPtr = WeightStore.write(table);
 
+        // Chunk addresses go into page contracts, and the directory lists the pages.
+        // A single directory would cap the model at MAX_PAYLOAD / 20 chunks.
+        bytes memory page;
         bytes memory dir = abi.encodePacked(tokPtr);
         uint256 n = (blob.length + WeightStore.MAX_PAYLOAD - 1) / WeightStore.MAX_PAYLOAD;
         for (uint256 i = 0; i < n; ++i) {
@@ -43,8 +46,14 @@ contract ResumableTest is Test {
                 let dst := add(part, 0x20)
                 for { let k := 0 } lt(k, len) { k := add(k, 0x20) } { mstore(add(dst, k), mload(add(src, k))) }
             }
-            dir = abi.encodePacked(dir, WeightStore.write(part));
+            page = abi.encodePacked(page, WeightStore.write(part));
+            if (page.length / 20 == WeightStore.PER_PAGE) {
+                dir = abi.encodePacked(dir, WeightStore.write(page));
+                page = "";
+            }
         }
+
+        if (page.length > 0) dir = abi.encodePacked(dir, WeightStore.write(page));
 
         Transformer.Config memory c = Transformer.Config({
             dim: 64,

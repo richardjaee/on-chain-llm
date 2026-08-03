@@ -20,6 +20,9 @@ contract DeployScript is Script {
         vm.startBroadcast();
 
         address tokPtr = WeightStore.write(table);
+        // Chunk addresses go into page contracts, and the directory lists the pages.
+        // A single directory would cap the model at MAX_PAYLOAD / 20 chunks.
+        bytes memory page;
         bytes memory dir = abi.encodePacked(tokPtr);
         uint256 n = (blob.length + WeightStore.MAX_PAYLOAD - 1) / WeightStore.MAX_PAYLOAD;
         for (uint256 i = 0; i < n; ++i) {
@@ -28,6 +31,8 @@ contract DeployScript is Script {
             if (len > WeightStore.MAX_PAYLOAD) len = WeightStore.MAX_PAYLOAD;
             dir = abi.encodePacked(dir, WeightStore.write(_slice(blob, s, len)));
         }
+        if (page.length > 0) dir = abi.encodePacked(dir, WeightStore.write(page));
+
         address dirPtr = WeightStore.write(dir);
 
         llm = new OnchainLLM(

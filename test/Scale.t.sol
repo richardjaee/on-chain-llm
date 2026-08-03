@@ -26,6 +26,9 @@ contract ScaleTest is Test {
         // The token table is only needed to decode output, which this never does.
         address tokPtr = WeightStore.write(hex"00010000");
 
+        // Chunk addresses go into page contracts, and the directory lists the pages.
+        // A single directory would cap the model at MAX_PAYLOAD / 20 chunks.
+        bytes memory page;
         bytes memory dir = abi.encodePacked(tokPtr);
         uint256 n = (blob.length + WeightStore.MAX_PAYLOAD - 1) / WeightStore.MAX_PAYLOAD;
         for (uint256 i = 0; i < n; ++i) {
@@ -38,24 +41,35 @@ contract ScaleTest is Test {
                 let dst := add(part, 0x20)
                 for { let k := 0 } lt(k, len) { k := add(k, 0x20) } { mstore(add(dst, k), mload(add(src, k))) }
             }
-            dir = abi.encodePacked(dir, WeightStore.write(part));
+            page = abi.encodePacked(page, WeightStore.write(part));
+            if (page.length / 20 == WeightStore.PER_PAGE) {
+                dir = abi.encodePacked(dir, WeightStore.write(page));
+                page = "";
+            }
         }
+        if (page.length > 0) dir = abi.encodePacked(dir, WeightStore.write(page));
+
         console2.log("chunks deployed:", n);
 
+        uint32 dim = uint32(vm.envOr("DIM", uint256(256)));
+        uint32 heads = uint32(vm.envOr("HEADS", uint256(8)));
+        uint32 kv = uint32(vm.envOr("KVHEADS", uint256(4)));
         cfg = Transformer.Config({
-            dim: 256,
-            hidden: 688,
-            nLayers: 2,
-            nHeads: 8,
-            nKv: 4,
-            vocab: 512,
-            seqLen: 256,
-            hs: 32,
-            kvd: 128,
+            dim: dim,
+            hidden: uint32(vm.envOr("HIDDEN", uint256(688))),
+            nLayers: uint32(vm.envOr("LAYERS", uint256(2))),
+            nHeads: heads,
+            nKv: kv,
+            vocab: uint32(vm.envOr("VOCAB", uint256(512))),
+            seqLen: uint32(vm.envOr("SEQLEN", uint256(256))),
+            hs: dim / heads,
+            kvd: (dim / heads) * kv,
             shared: true,
             invSqrtHs: 0
         });
-        llm = new OnchainLLM(WeightStore.write(dir), cfg, 0);
+        console2.log("dim", cfg.dim, "hidden", cfg.hidden);
+        llm = new OnchainLLM(WeightStore.write(dir), cfg, vm.envOr("MACS", uint256(0)));
+        console2.log("macsPerPhase", llm.macsPerPhase());
     }
 
     /// @notice Cost of each phase in isolation. A large `reserve` makes the gas loop

@@ -9,7 +9,7 @@ import {WeightStore} from "../src/WeightStore.sol";
 /// @notice Temporary instrumentation: where does the gas in one `step` actually go?
 contract ProfileTest is Test {
     OnchainLLM internal llm;
-    address[] internal chunks;
+    address[] internal chunkAddrs;
     Transformer.Config internal cfg;
 
     function setUp() public {
@@ -19,6 +19,9 @@ contract ProfileTest is Test {
             vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/tokens.hex"))));
         address tokPtr = WeightStore.write(table);
 
+        // Chunk addresses go into page contracts, and the directory lists the pages.
+        // A single directory would cap the model at MAX_PAYLOAD / 20 chunks.
+        bytes memory page;
         bytes memory dir = abi.encodePacked(tokPtr);
         uint256 n = (blob.length + WeightStore.MAX_PAYLOAD - 1) / WeightStore.MAX_PAYLOAD;
         for (uint256 i = 0; i < n; ++i) {
@@ -31,10 +34,16 @@ contract ProfileTest is Test {
                 let dst := add(part, 0x20)
                 for { let k := 0 } lt(k, len) { k := add(k, 0x20) } { mstore(add(dst, k), mload(add(src, k))) }
             }
-            address p = WeightStore.write(part);
-            chunks.push(p);
-            dir = abi.encodePacked(dir, p);
+            address cp = WeightStore.write(part);
+            chunkAddrs.push(cp);
+            page = abi.encodePacked(page, cp);
+            if (page.length / 20 == WeightStore.PER_PAGE) {
+                dir = abi.encodePacked(dir, WeightStore.write(page));
+                page = "";
+            }
         }
+
+        if (page.length > 0) dir = abi.encodePacked(dir, WeightStore.write(page));
 
         cfg = Transformer.Config({
             dim: 64,
@@ -58,7 +67,7 @@ contract ProfileTest is Test {
         uint256 blobLen = o.ropeSin + uint256(c.seqLen) * (c.hs / 2) * 4;
         console2.log("blob bytes", blobLen);
 
-        address[] memory ch = chunks;
+        address[] memory ch = chunkAddrs;
 
         uint256 g = gasleft();
         bytes memory w = new bytes(blobLen);
@@ -162,7 +171,7 @@ contract ProfileTest is Test {
         Transformer.Config memory c = llm.config();
         Transformer.Layout memory o = Transformer.layout(c);
         uint256 blobLen = o.ropeSin + uint256(c.seqLen) * (c.hs / 2) * 4;
-        address[] memory ch = chunks;
+        address[] memory ch = chunkAddrs;
 
         bytes memory w = new bytes(blobLen);
         WeightStore.readRange(ch, 0, blobLen, w);

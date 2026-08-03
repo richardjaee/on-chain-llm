@@ -390,7 +390,7 @@ library Transformer {
     /// @dev Copy rows [r0, r0+n) of a tensor block into `dest` at `at`, preserving the
     ///      [shifts][values] layout. Returns bytes written.
     function _sliceRows(
-        address[] memory chunks,
+        address[] memory pages,
         bytes memory dest,
         uint256 at,
         uint256 base,
@@ -399,8 +399,8 @@ library Transformer {
         uint256 n,
         uint256 cols
     ) private view returns (uint256) {
-        WeightStore.readRangeAt(chunks, base + r0, n, dest, at);
-        WeightStore.readRangeAt(chunks, base + rowsTotal + r0 * cols * 2, n * cols * 2, dest, at + n);
+        WeightStore.readRangeAt(pages, base + r0, n, dest, at);
+        WeightStore.readRangeAt(pages, base + rowsTotal + r0 * cols * 2, n * cols * 2, dest, at + n);
         return n + n * cols * 2;
     }
 
@@ -409,7 +409,7 @@ library Transformer {
     uint256 private constant SLICE_PAD = 32;
 
     /// @notice Weights for one PREPARE: rms_att, W_q/W_k/W_v for layer `l`, RoPE at `pos`
-    function slicePrepare(address[] memory chunks, Layout memory o, Config memory c, uint256 l, uint256 pos)
+    function slicePrepare(address[] memory pages, Layout memory o, Config memory c, uint256 l, uint256 pos)
         internal
         view
         returns (bytes memory data, Layout memory s)
@@ -424,28 +424,28 @@ library Transformer {
         uint256 at = 0;
 
         // rms_att is a single-row block: shift byte, then this layer's slice of gains
-        WeightStore.readRangeAt(chunks, o.rmsAtt, 1, data, at);
-        WeightStore.readRangeAt(chunks, o.rmsAtt + 1 + l * dim * 2, dim * 2, data, at + 1);
+        WeightStore.readRangeAt(pages, o.rmsAtt, 1, data, at);
+        WeightStore.readRangeAt(pages, o.rmsAtt + 1 + l * dim * 2, dim * 2, data, at + 1);
         s.rmsAtt = at;
         at += 1 + dim * 2;
 
         s.wq = at;
-        at += _sliceRows(chunks, data, at, o.wq, uint256(c.nLayers) * dim, l * dim, dim, dim);
+        at += _sliceRows(pages, data, at, o.wq, uint256(c.nLayers) * dim, l * dim, dim, dim);
         s.wk = at;
-        at += _sliceRows(chunks, data, at, o.wk, uint256(c.nLayers) * c.kvd, l * c.kvd, c.kvd, dim);
+        at += _sliceRows(pages, data, at, o.wk, uint256(c.nLayers) * c.kvd, l * c.kvd, c.kvd, dim);
         s.wv = at;
-        at += _sliceRows(chunks, data, at, o.wv, uint256(c.nLayers) * c.kvd, l * c.kvd, c.kvd, dim);
+        at += _sliceRows(pages, data, at, o.wv, uint256(c.nLayers) * c.kvd, l * c.kvd, c.kvd, dim);
 
         // Only this position's RoPE row, so the caller passes pos = 0
         s.ropeCos = at;
-        WeightStore.readRangeAt(chunks, o.ropeCos + pos * half * 4, half * 4, data, at);
+        WeightStore.readRangeAt(pages, o.ropeCos + pos * half * 4, half * 4, data, at);
         at += half * 4;
         s.ropeSin = at;
-        WeightStore.readRangeAt(chunks, o.ropeSin + pos * half * 4, half * 4, data, at);
+        WeightStore.readRangeAt(pages, o.ropeSin + pos * half * 4, half * 4, data, at);
     }
 
     /// @notice Weights for one PROJECT: W_o, rms_ffn, and W_1/W_2/W_3 for layer `l`
-    function sliceProject(address[] memory chunks, Layout memory o, Config memory c, uint256 l)
+    function sliceProject(address[] memory pages, Layout memory o, Config memory c, uint256 l)
         internal
         view
         returns (bytes memory data, Layout memory s)
@@ -457,45 +457,45 @@ library Transformer {
         uint256 at = 0;
 
         s.wo = at;
-        at += _sliceRows(chunks, data, at, o.wo, uint256(c.nLayers) * dim, l * dim, dim, dim);
+        at += _sliceRows(pages, data, at, o.wo, uint256(c.nLayers) * dim, l * dim, dim, dim);
 
-        WeightStore.readRangeAt(chunks, o.rmsFfn, 1, data, at);
-        WeightStore.readRangeAt(chunks, o.rmsFfn + 1 + l * dim * 2, dim * 2, data, at + 1);
+        WeightStore.readRangeAt(pages, o.rmsFfn, 1, data, at);
+        WeightStore.readRangeAt(pages, o.rmsFfn + 1 + l * dim * 2, dim * 2, data, at + 1);
         s.rmsFfn = at;
         at += 1 + dim * 2;
 
         s.w1 = at;
-        at += _sliceRows(chunks, data, at, o.w1, uint256(c.nLayers) * hid, l * hid, hid, dim);
+        at += _sliceRows(pages, data, at, o.w1, uint256(c.nLayers) * hid, l * hid, hid, dim);
         s.w2 = at;
-        at += _sliceRows(chunks, data, at, o.w2, uint256(c.nLayers) * dim, l * dim, dim, hid);
+        at += _sliceRows(pages, data, at, o.w2, uint256(c.nLayers) * dim, l * dim, dim, hid);
         s.w3 = at;
-        at += _sliceRows(chunks, data, at, o.w3, uint256(c.nLayers) * hid, l * hid, hid, dim);
+        at += _sliceRows(pages, data, at, o.w3, uint256(c.nLayers) * hid, l * hid, hid, dim);
     }
 
     /// @notice W_cls rows [r0, r0+n) — one shard of the classifier
-    function sliceClassifyRows(address[] memory chunks, Layout memory o, Config memory c, uint256 r0, uint256 n)
+    function sliceClassifyRows(address[] memory pages, Layout memory o, Config memory c, uint256 r0, uint256 n)
         internal
         view
         returns (bytes memory data, Layout memory s)
     {
         data = new bytes(blockSize(n, c.dim) + SLICE_PAD);
         s.wcls = 0;
-        _sliceRows(chunks, data, 0, o.wcls, c.vocab, r0, n, c.dim);
+        _sliceRows(pages, data, 0, o.wcls, c.vocab, r0, n, c.dim);
     }
 
     /// @notice The final RMSNorm gains, as a single-row block
-    function sliceRmsFinal(address[] memory chunks, Layout memory o, Config memory c)
+    function sliceRmsFinal(address[] memory pages, Layout memory o, Config memory c)
         internal
         view
         returns (bytes memory data, Layout memory s)
     {
         data = new bytes(1 + c.dim * 2 + SLICE_PAD);
         s.rmsFinal = 0;
-        WeightStore.readRangeAt(chunks, o.rmsFinal, 1 + c.dim * 2, data, 0);
+        WeightStore.readRangeAt(pages, o.rmsFinal, 1 + c.dim * 2, data, 0);
     }
 
     /// @notice Weights for the classifier: final RMSNorm gains and the whole W_cls
-    function sliceClassify(address[] memory chunks, Layout memory o, Config memory c)
+    function sliceClassify(address[] memory pages, Layout memory o, Config memory c)
         internal
         view
         returns (bytes memory data, Layout memory s)
@@ -503,20 +503,20 @@ library Transformer {
         uint256 n = 1 + c.dim * 2 + blockSize(c.vocab, c.dim);
         data = new bytes(n + SLICE_PAD);
         s.rmsFinal = 0;
-        WeightStore.readRangeAt(chunks, o.rmsFinal, 1 + c.dim * 2, data, 0);
+        WeightStore.readRangeAt(pages, o.rmsFinal, 1 + c.dim * 2, data, 0);
         s.wcls = 1 + c.dim * 2;
-        _sliceRows(chunks, data, s.wcls, o.wcls, c.vocab, 0, c.vocab, c.dim);
+        _sliceRows(pages, data, s.wcls, o.wcls, c.vocab, 0, c.vocab, c.dim);
     }
 
     /// @notice The single token-embedding row for `token`
-    function sliceEmbed(address[] memory chunks, Layout memory o, Config memory c, uint256 token)
+    function sliceEmbed(address[] memory pages, Layout memory o, Config memory c, uint256 token)
         internal
         view
         returns (bytes memory data, Layout memory s)
     {
         data = new bytes(1 + c.dim * 2 + SLICE_PAD);
         s.tokEmb = 0;
-        _sliceRows(chunks, data, 0, o.tokEmb, c.vocab, token, 1, c.dim);
+        _sliceRows(pages, data, 0, o.tokEmb, c.vocab, token, 1, c.dim);
     }
 
     /// @notice A Config addressing a one-layer slice: same arithmetic, local offsets
@@ -541,20 +541,20 @@ library Transformer {
     }
 
     /// @notice The rms_att gains for one layer, as a single-row block
-    function sliceRmsAtt(address[] memory chunks, Layout memory o, Config memory c, uint256 l)
+    function sliceRmsAtt(address[] memory pages, Layout memory o, Config memory c, uint256 l)
         internal
         view
         returns (bytes memory data, Layout memory s)
     {
         data = new bytes(1 + c.dim * 2 + SLICE_PAD);
         s.rmsAtt = 0;
-        WeightStore.readRangeAt(chunks, o.rmsAtt, 1, data, 0);
-        WeightStore.readRangeAt(chunks, o.rmsAtt + 1 + l * c.dim * 2, c.dim * 2, data, 1);
+        WeightStore.readRangeAt(pages, o.rmsAtt, 1, data, 0);
+        WeightStore.readRangeAt(pages, o.rmsAtt + 1 + l * c.dim * 2, c.dim * 2, data, 1);
     }
 
     /// @notice W_q rows [r0, r0+n) plus this position's RoPE row
     function sliceQRows(
-        address[] memory chunks,
+        address[] memory pages,
         Layout memory o,
         Config memory c,
         uint256 l,
@@ -566,16 +566,16 @@ library Transformer {
         uint256 body = blockSize(n, c.dim);
         data = new bytes(body + half * 8 + SLICE_PAD);
         s.wq = 0;
-        _sliceRows(chunks, data, 0, o.wq, uint256(c.nLayers) * c.dim, l * c.dim + r0, n, c.dim);
+        _sliceRows(pages, data, 0, o.wq, uint256(c.nLayers) * c.dim, l * c.dim + r0, n, c.dim);
         s.ropeCos = body;
-        WeightStore.readRangeAt(chunks, o.ropeCos + pos * half * 4, half * 4, data, body);
+        WeightStore.readRangeAt(pages, o.ropeCos + pos * half * 4, half * 4, data, body);
         s.ropeSin = body + half * 4;
-        WeightStore.readRangeAt(chunks, o.ropeSin + pos * half * 4, half * 4, data, body + half * 4);
+        WeightStore.readRangeAt(pages, o.ropeSin + pos * half * 4, half * 4, data, body + half * 4);
     }
 
     /// @notice W_k and W_v rows [r0, r0+n) plus this position's RoPE row
     function sliceKvRows(
-        address[] memory chunks,
+        address[] memory pages,
         Layout memory o,
         Config memory c,
         uint256 l,
@@ -587,13 +587,13 @@ library Transformer {
         uint256 one = blockSize(n, c.dim);
         data = new bytes(one * 2 + half * 8 + SLICE_PAD);
         s.wk = 0;
-        _sliceRows(chunks, data, 0, o.wk, uint256(c.nLayers) * c.kvd, l * c.kvd + r0, n, c.dim);
+        _sliceRows(pages, data, 0, o.wk, uint256(c.nLayers) * c.kvd, l * c.kvd + r0, n, c.dim);
         s.wv = one;
-        _sliceRows(chunks, data, one, o.wv, uint256(c.nLayers) * c.kvd, l * c.kvd + r0, n, c.dim);
+        _sliceRows(pages, data, one, o.wv, uint256(c.nLayers) * c.kvd, l * c.kvd + r0, n, c.dim);
         s.ropeCos = one * 2;
-        WeightStore.readRangeAt(chunks, o.ropeCos + pos * half * 4, half * 4, data, one * 2);
+        WeightStore.readRangeAt(pages, o.ropeCos + pos * half * 4, half * 4, data, one * 2);
         s.ropeSin = one * 2 + half * 4;
-        WeightStore.readRangeAt(chunks, o.ropeSin + pos * half * 4, half * 4, data, one * 2 + half * 4);
+        WeightStore.readRangeAt(pages, o.ropeSin + pos * half * 4, half * 4, data, one * 2 + half * 4);
     }
 
     /// @notice One Q shard: rows [r0, r0+n) of W_q, rotated in place
@@ -708,18 +708,18 @@ library Transformer {
     }
 
     /// @notice Weights for a W_o shard: rows [r0, r0+n)
-    function sliceWo(address[] memory chunks, Layout memory o, Config memory c, uint256 l, uint256 r0, uint256 n)
+    function sliceWo(address[] memory pages, Layout memory o, Config memory c, uint256 l, uint256 r0, uint256 n)
         internal
         view
         returns (bytes memory data, Layout memory s)
     {
         data = new bytes(blockSize(n, c.dim) + SLICE_PAD);
         s.wo = 0;
-        _sliceRows(chunks, data, 0, o.wo, uint256(c.nLayers) * c.dim, l * c.dim + r0, n, c.dim);
+        _sliceRows(pages, data, 0, o.wo, uint256(c.nLayers) * c.dim, l * c.dim + r0, n, c.dim);
     }
 
     /// @notice Weights for a SwiGLU shard: W_1 and W_3 rows [r0, r0+n), plus rms_ffn
-    function sliceFfn1(address[] memory chunks, Layout memory o, Config memory c, uint256 l, uint256 r0, uint256 n)
+    function sliceFfn1(address[] memory pages, Layout memory o, Config memory c, uint256 l, uint256 r0, uint256 n)
         internal
         view
         returns (bytes memory data, Layout memory s)
@@ -727,32 +727,32 @@ library Transformer {
         uint256 one = blockSize(n, c.dim);
         data = new bytes(one * 2 + SLICE_PAD);
         s.w1 = 0;
-        _sliceRows(chunks, data, 0, o.w1, uint256(c.nLayers) * c.hidden, l * c.hidden + r0, n, c.dim);
+        _sliceRows(pages, data, 0, o.w1, uint256(c.nLayers) * c.hidden, l * c.hidden + r0, n, c.dim);
         s.w3 = one;
-        _sliceRows(chunks, data, one, o.w3, uint256(c.nLayers) * c.hidden, l * c.hidden + r0, n, c.dim);
+        _sliceRows(pages, data, one, o.w3, uint256(c.nLayers) * c.hidden, l * c.hidden + r0, n, c.dim);
     }
 
     /// @notice Weights for a W_2 shard: rows [r0, r0+n)
-    function sliceFfn2(address[] memory chunks, Layout memory o, Config memory c, uint256 l, uint256 r0, uint256 n)
+    function sliceFfn2(address[] memory pages, Layout memory o, Config memory c, uint256 l, uint256 r0, uint256 n)
         internal
         view
         returns (bytes memory data, Layout memory s)
     {
         data = new bytes(blockSize(n, c.hidden) + SLICE_PAD);
         s.w2 = 0;
-        _sliceRows(chunks, data, 0, o.w2, uint256(c.nLayers) * c.dim, l * c.dim + r0, n, c.hidden);
+        _sliceRows(pages, data, 0, o.w2, uint256(c.nLayers) * c.dim, l * c.dim + r0, n, c.hidden);
     }
 
     /// @notice The rms_ffn gains for one layer, as a single-row block
-    function sliceRmsFfn(address[] memory chunks, Layout memory o, Config memory c, uint256 l)
+    function sliceRmsFfn(address[] memory pages, Layout memory o, Config memory c, uint256 l)
         internal
         view
         returns (bytes memory data, Layout memory s)
     {
         data = new bytes(1 + c.dim * 2 + SLICE_PAD);
         s.rmsFfn = 0;
-        WeightStore.readRangeAt(chunks, o.rmsFfn, 1, data, 0);
-        WeightStore.readRangeAt(chunks, o.rmsFfn + 1 + l * c.dim * 2, c.dim * 2, data, 1);
+        WeightStore.readRangeAt(pages, o.rmsFfn, 1, data, 0);
+        WeightStore.readRangeAt(pages, o.rmsFfn + 1 + l * c.dim * 2, c.dim * 2, data, 1);
     }
 
     /// @notice PROJECT: output projection, residual, and the feed-forward network

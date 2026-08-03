@@ -630,13 +630,35 @@ contract OnchainLLM {
     }
 
     // ------------------------------------------------------------- internals
+    /// @dev The directory lists page contracts, each holding up to PER_PAGE chunk
+    ///      addresses, because listing chunks directly in one directory caps the model
+    ///      at 1228 chunks — 30MB, or 15M int16 parameters. Pages square that.
+    ///
+    ///      The chunk list is expanded here rather than resolved per lookup, costing one
+    ///      word of memory per chunk: negligible at thousands of chunks, and the
+    ///      dominant per-transaction cost in the tens of thousands, which is where the
+    ///      next change would be needed.
     function _dir() private view returns (address tokPtr, address[] memory chunks) {
         bytes memory d = WeightStore.read(directory);
-        uint256 n = d.length / 20 - 1;
+        uint256 np = d.length / 20 - 1;
         tokPtr = _addr(d, 0);
-        chunks = new address[](n);
-        for (uint256 i = 0; i < n; ++i) {
-            chunks[i] = _addr(d, (i + 1) * 20);
+
+        bytes[] memory raw = new bytes[](np);
+        uint256 total = 0;
+        for (uint256 i = 0; i < np; ++i) {
+            raw[i] = WeightStore.read(_addr(d, (i + 1) * 20));
+            total += raw[i].length / 20;
+        }
+        chunks = new address[](total);
+        uint256 k = 0;
+        for (uint256 i = 0; i < np; ++i) {
+            uint256 m = raw[i].length / 20;
+            for (uint256 j = 0; j < m; ++j) {
+                chunks[k] = _addr(raw[i], j * 20);
+                unchecked {
+                    k += 1;
+                }
+            }
         }
     }
 

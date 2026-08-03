@@ -110,6 +110,36 @@ contract ScaleTest is Test {
         }
     }
 
+    /// @notice What does resolving the chunk directory cost per transaction? Every
+    ///         `step` rebuilds it, so it is paid whether or not any weight is read.
+    function test_DirectoryCost() public view {
+        if (!have) return;
+        address dir = llm.directory();
+        uint256 g = gasleft();
+        bytes memory d = WeightStore.read(dir);
+        uint256 np = d.length / 20 - 1;
+        bytes[] memory raw = new bytes[](np);
+        uint256 total = 0;
+        for (uint256 i = 0; i < np; ++i) {
+            raw[i] = WeightStore.read(address(uint160(uint256(bytes32(_slice20(d, (i + 1) * 20))) >> 96)));
+            total += raw[i].length / 20;
+        }
+        address[] memory chunks = new address[](total);
+        uint256 k = 0;
+        for (uint256 i = 0; i < np; ++i) {
+            uint256 m = raw[i].length / 20;
+            for (uint256 j = 0; j < m; ++j) {
+                chunks[k++] = address(uint160(uint256(bytes32(_slice20(raw[i], j * 20))) >> 96));
+            }
+        }
+        console2.log("pages", np, "chunks", total);
+        console2.log("directory resolution gas:", g - gasleft());
+    }
+
+    function _slice20(bytes memory b, uint256 off) internal pure returns (bytes32 r) {
+        assembly ("memory-safe") { r := mload(add(add(b, 0x20), off)) }
+    }
+
     /// @notice Whole-blob path only: does the library itself get the right first token?
     ///         Isolates the arithmetic from the resumable phase machine.
     function test_LibraryFirstToken() public view {
@@ -241,7 +271,7 @@ contract ScaleTest is Test {
             assertEq(uint256(got[i]), want[i], "on-chain diverged from the specification");
         }
         console2.log("tokens matching spec:", n);
-        console2.log("decoded text:", llm.text());
+        if (bytes(vm.envOr("TOKENS", string(""))).length > 0) console2.log("decoded text:", llm.text());
         console2.log("transactions        :", txs);
         console2.log("total gas           :", total);
         console2.log("peak tx gas         :", peak);

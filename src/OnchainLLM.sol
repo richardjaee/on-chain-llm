@@ -593,10 +593,23 @@ contract OnchainLLM {
     }
 
     /// @notice Decode the generated tokens on-chain
+    /// @dev The directory's first entry points at a page listing the token table's own
+    ///      chunks, not at the table itself: at a 32k vocabulary the table is ~306KB and
+    ///      cannot be one data contract. This is a view, so the assembly costs an
+    ///      eth_call rather than a transaction.
     function text() public view returns (string memory) {
         if (generated.length == 0) return "";
         (address tokPtr,) = _dir();
-        bytes memory table = WeightStore.read(tokPtr);
+        bytes memory page = WeightStore.read(tokPtr);
+        uint256 nc = page.length / 20;
+        address[] memory tc = new address[](nc);
+        uint256 len = 0;
+        for (uint256 i = 0; i < nc; ++i) {
+            tc[i] = _addr(page, i * 20);
+            len += WeightStore.size(tc[i]);
+        }
+        bytes memory table = new bytes(len);
+        WeightStore.readRange(tc, 0, len, table);
         uint16[] memory ids = generated;
         return string(Decoder.decode(table, ids, ids.length, promptIds[promptIds.length - 1]));
     }

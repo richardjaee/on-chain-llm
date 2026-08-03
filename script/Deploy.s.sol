@@ -19,7 +19,7 @@ contract DeployScript is Script {
 
         vm.startBroadcast();
 
-        address tokPtr = WeightStore.write(table);
+        address tokPtr = _writePaged(table);
         // Chunk addresses go into page contracts, and the directory lists the pages.
         // A single directory would cap the model at MAX_PAYLOAD / 20 chunks.
         bytes memory page;
@@ -69,5 +69,24 @@ contract DeployScript is Script {
             let dst := add(out, 0x20)
             for { let i := 0 } lt(i, len) { i := add(i, 0x20) } { mstore(add(dst, i), mload(add(src, i))) }
         }
+    }
+
+    /// @dev Store a blob as chunk contracts and return a page listing them
+    function _writePaged(bytes memory blob) internal returns (address) {
+        bytes memory list;
+        uint256 n = (blob.length + WeightStore.MAX_PAYLOAD - 1) / WeightStore.MAX_PAYLOAD;
+        for (uint256 i = 0; i < n; ++i) {
+            uint256 s0 = i * WeightStore.MAX_PAYLOAD;
+            uint256 len = blob.length - s0;
+            if (len > WeightStore.MAX_PAYLOAD) len = WeightStore.MAX_PAYLOAD;
+            bytes memory part = new bytes(len);
+            assembly ("memory-safe") {
+                let src := add(add(blob, 0x20), s0)
+                let dst := add(part, 0x20)
+                for { let k := 0 } lt(k, len) { k := add(k, 0x20) } { mstore(add(dst, k), mload(add(src, k))) }
+            }
+            list = abi.encodePacked(list, WeightStore.write(part));
+        }
+        return WeightStore.write(list);
     }
 }

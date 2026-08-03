@@ -30,8 +30,15 @@ contract ScaleTest is Test {
         CAP = vm.envOr("CAP", uint256(14_000_000));
 
         bytes memory blob = vm.parseBytes(string.concat("0x", vm.readFile(path)));
-        // The token table is only needed to decode output, which this never does.
-        address tokPtr = WeightStore.write(hex"00010000");
+        // A real token table when one is supplied, so `text()` can be checked too.
+        string memory tp = vm.envOr("TOKENS", string(""));
+        address tokPtr;
+        if (bytes(tp).length > 0) {
+            bytes memory tbl = vm.parseBytes(string.concat("0x", vm.readFile(tp)));
+            tokPtr = _writePaged(tbl);
+        } else {
+            tokPtr = _writePaged(hex"00010000");
+        }
 
         // Chunk addresses go into page contracts, and the directory lists the pages.
         // A single directory would cap the model at MAX_PAYLOAD / 20 chunks.
@@ -234,6 +241,7 @@ contract ScaleTest is Test {
             assertEq(uint256(got[i]), want[i], "on-chain diverged from the specification");
         }
         console2.log("tokens matching spec:", n);
+        console2.log("decoded text:", llm.text());
         console2.log("transactions        :", txs);
         console2.log("total gas           :", total);
         console2.log("peak tx gas         :", peak);
@@ -284,5 +292,24 @@ contract ScaleTest is Test {
         console2.log("steps        :", llm.steps());
 
         assertLt(peak, CAP + 1, "a transaction exceeded the ceiling");
+    }
+
+    /// @dev Store a blob as chunk contracts and return a page listing them
+    function _writePaged(bytes memory blob) internal returns (address) {
+        bytes memory list;
+        uint256 n = (blob.length + WeightStore.MAX_PAYLOAD - 1) / WeightStore.MAX_PAYLOAD;
+        for (uint256 i = 0; i < n; ++i) {
+            uint256 s0 = i * WeightStore.MAX_PAYLOAD;
+            uint256 len = blob.length - s0;
+            if (len > WeightStore.MAX_PAYLOAD) len = WeightStore.MAX_PAYLOAD;
+            bytes memory part = new bytes(len);
+            assembly ("memory-safe") {
+                let src := add(add(blob, 0x20), s0)
+                let dst := add(part, 0x20)
+                for { let k := 0 } lt(k, len) { k := add(k, 0x20) } { mstore(add(dst, k), mload(add(src, k))) }
+            }
+            list = abi.encodePacked(list, WeightStore.write(part));
+        }
+        return WeightStore.write(list);
     }
 }

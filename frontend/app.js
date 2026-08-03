@@ -47,8 +47,19 @@ const ABI = [
 ];
 const iface = new E.Interface(ABI);
 
-const STEP_GAS = 14_000_000n, START_GAS = 3_000_000n, RESERVE = 400_000n;
-const GAS_PER_STEP = 11_000_000n;
+const STEP_GAS = 14_000_000n, RESERVE = 400_000n;
+
+/* `start` allocates the residual stream, which is one storage slot per dimension, so
+ * its cost scales with the model: ~1.6M gas at dim 64 and ~5.8M at dim 288. A fixed
+ * 3M was fine for the first model and silently too small for the second. */
+const startGas = () => 800_000n + BigInt(geom ? geom.dim : 64) * 25_000n;
+
+/* Rough gas for one phase, from the model's width. Phases are bounded by the MAC
+ * budget, but the fixed part of one — slice reads, checkpoints, the norm recompute —
+ * grows with dim, and that is what dominates the estimate. Deliberately generous:
+ * under-funding strands a run mid-flight, over-funding is recoverable from the
+ * session key. Measured ~0.76M at dim 64 and ~5.3M at dim 288. */
+const phaseGas = () => 1_200_000n + BigInt(geom ? geom.dim : 64) * 15_000n;
 
 const PROMPT_KEY = "onchain-llm-last-prompt";
 /* The session key is persisted (testnet only) so leftover funds survive a page
@@ -343,16 +354,42 @@ async function sessionBalance() {
   $("sessBal").textContent = (+E.formatEther(b)).toFixed(5) + " ETH";
   return b;
 }
-async function estimateCost(txCount) {
+/* Total cost of `positions` positions, from the phase count the contract reports and
+ * a per-phase estimate derived from its width. The old form multiplied a transaction
+ * count by a fixed 11M, which stopped meaning anything once a transaction packed
+ * several phases and a phase stopped costing 11M. */
+async function estimateCost(positions) {
   const fee = await withFailover(async (p) => (await p.getFeeData()).maxFeePerGas || 2000000n);
-  return (BigInt(txCount) * GAS_PER_STEP * fee * 16n) / 10n; // 1.6x for fee drift + L1 data
+  const gas = BigInt(positions) * BigInt(geom.phasesPerPos) * phaseGas();
+  return (gas * fee * 13n) / 10n; // 1.3x for fee drift and L1 data
 }
-async function ensureFunded(txCount) {
-  const need = await estimateCost(txCount);
+async function ensureFunded(positions) {
+  const need = await estimateCost(positions);
   const bal = await sessionBalance();
   if (bal >= need) { addTx({ kind: "session already funded", msg: "no approval needed", cls: "note" }); return; }
   const signer = await ensureWallet();
-  const top = need - bal;
+  const from = await signer.getAddress();
+  const have = await withFailover((p) => p.getBalance(from));
+  // Never ask for more than the wallet holds. The estimate is deliberately generous
+  // and a large model can exceed a testnet balance outright; asking anyway produces a
+  // failed gas estimation whose error names nothing useful.
+  const keep = 2_000_000_000_000_000n; // leave 0.002 for the wallet's own gas
+  let top = need - bal;
+  if (have < top + keep) {
+    top = have > keep ? have - keep : 0n;
+    if (top === 0n) {
+      throw new Error(
+        `wallet holds ${(+E.formatEther(have)).toFixed(4)} ETH, this run needs about ` +
+        `${(+E.formatEther(need)).toFixed(4)} ETH — reduce the token count`
+      );
+    }
+    addTx({
+      kind: "partial funding",
+      msg: `run needs about ${(+E.formatEther(need)).toFixed(4)} ETH, funding ${(+E.formatEther(top)).toFixed(4)} ` +
+           `— it will stop when the session runs out and can be resumed`,
+      cls: "err",
+    });
+  }
   status(`Approve once to fund the run (${(+E.formatEther(top)).toFixed(4)} ETH)…`, "busy");
   const t = await signer.sendTransaction({ to: session.address, value: top });
   await t.wait();
@@ -497,19 +534,20 @@ async function generate() {
     await loadGeom();
     const ids = tok.encode(text);
     const maxNew = parseInt($("maxnew").value, 10);
-    const txCount = (ids.length + maxNew) * geom.phasesPerPos;
+    const positions = ids.length + maxNew;
     rememberPrompt(text);
+    updateEstimate();
     $("carry").textContent = "";
     $("storyPrompt").textContent = text;
     $("storyOld").textContent = ""; $("storyNew").textContent = "";
     ensureSession();
     addTx({ kind: "tokenized in browser", msg: `${ids.length} ids: [${ids.join(", ")}]`, cls: "note" });
     status("Preparing…", "busy");
-    await ensureFunded(txCount);
+    await ensureFunded(positions);
 
     status("Starting generation…", "busy");
     const c = new E.Contract(addr(), ABI, session);
-    const st = await c.start(ids, maxNew, { gasLimit: START_GAS });
+    const st = await c.start(ids, maxNew, { gasLimit: startGas() });
     const sr = await st.wait();
     sessionGas += sr.gasUsed;
     addTx({ kind: "generation started", msg: `prompt ${ids.length} tokens, generating up to ${maxNew}`, gas: sr.gasUsed, hash: st.hash, cls: "note" });
@@ -547,11 +585,16 @@ async function sweep() {
 function updateEstimate() {
   const n = parseInt($("maxnew").value, 10);
   const ids = tok.encode($("prompt").value.trim() || " ");
-  const txs = (ids.length + n) * 6;
   $("maxnewOut").textContent = n;
+  if (!geom) {
+    $("estimate").textContent = `prompt is ${ids.length} tokens · ${n} new — press Generate to read the model's cost`;
+    return;
+  }
+  const positions = ids.length + n;
+  const gas = BigInt(positions) * BigInt(geom.phasesPerPos) * phaseGas();
   $("estimate").textContent =
-    `prompt is ${ids.length} tokens · ${n} new ≈ ${txs} transactions, ~${(txs * 11e6 * 0.006e-9).toFixed(4)} ETH ` +
-    `(tokens are fragments, so ${n} ≈ ${Math.round(n * 2.5)} characters)`;
+    `prompt is ${ids.length} tokens · ${n} new ≈ ${positions * geom.phasesPerPos} phases, ` +
+    `~${(Number(gas) * 0.006e-9).toFixed(4)} ETH (tokens are fragments, so ${n} ≈ ${Math.round(n * 2.5)} characters)`;
 }
 
 window.addEventListener("DOMContentLoaded", () => {

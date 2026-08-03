@@ -151,18 +151,48 @@ async function loadGeom() {
     };
   });
   if (!tokReady) {
-    if (geom.vocab > 512) {
-      // A 32k vocabulary is ~178KB of strings; fetched rather than inlined so the page
-      // does not carry a table most deployments never use.
-      const res = await fetch("tokenizer-llama.bin");
-      if (!res.ok) throw new Error("tokenizer-llama.bin not found, needed for vocab " + geom.vocab);
-      tok = makeLlamaTok(await res.arrayBuffer());
-      if (tok.size < geom.vocab) throw new Error("tokenizer has " + tok.size + " tokens, model needs " + geom.vocab);
+    tok = await loadTokenizer(geom.vocab);
+    if (tok.size < geom.vocab) {
+      throw new Error(`tokenizer has ${tok.size} tokens, the model needs ${geom.vocab}`);
     }
     tokReady = true;
-    addTx({ kind: "tokenizer loaded", msg: `${tok.size} tokens, matching the contract's vocabulary`, cls: "note" });
+    addTx({ kind: "tokenizer loaded", msg: `${TOKENIZERS[tokKind(geom.vocab)].what}, ${tok.size} tokens`, cls: "note" });
   }
   return geom;
+}
+
+/* Which tokenizer a model uses is not derivable from its geometry — two models can
+ * share a vocabulary size and disagree about what the ids mean — so it is recorded per
+ * deployment, with the vocabulary size as a fallback for an address typed in by hand.
+ * Getting it wrong does not fail: the prompt encodes to ids that are valid and mean
+ * something else, and the model answers a question nobody asked. */
+const TOKENIZERS = {
+  tok512: { what: "tok512, sentencepiece", load: async () => makeTok512(TOK512_SPEC) },
+  llama: {
+    what: "Llama sentencepiece",
+    load: async () => makeLlamaTok(await (await fetchAsset("tokenizer-llama.bin")).arrayBuffer()),
+  },
+  bpe: {
+    what: "byte-level BPE",
+    load: async () => makeBpeTok(await (await fetchAsset("tokenizer-bpe.json")).json()),
+  },
+};
+const BY_CONTRACT = {
+  "0xc2ff49e48a5e7e2e472e6858610cf92bfbcd0e1c": "tok512",
+  "0x676ef269b1fe68129ce7d8001349d6802b9e339e": "llama",
+};
+function tokKind(vocab) {
+  const known = BY_CONTRACT[addr().toLowerCase()];
+  if (known) return known;
+  return vocab <= 512 ? "tok512" : vocab <= 32000 ? "llama" : "bpe";
+}
+async function fetchAsset(name) {
+  const res = await fetch(name);
+  if (!res.ok) throw new Error(`${name} not found, and this model needs it`);
+  return res;
+}
+async function loadTokenizer(vocab) {
+  return TOKENIZERS[tokKind(vocab)].load();
 }
 
 /** Describe what a phase computed, in model terms, from the geometry on chain. */

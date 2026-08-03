@@ -42,11 +42,13 @@
               color:var(--ink-3); margin:0 0 .85rem; font-weight:500; }
 
   label { display:block; font-size:.8rem; color:var(--ink-2); margin:0 0 .35rem; }
-  textarea, input[type=text] {
+  textarea, input[type=text], select {
     width:100%; background:var(--panel-2); color:var(--ink); border:1px solid var(--rule);
     border-radius:4px; padding:.6rem .7rem; font-family:var(--mono); font-size:.92rem;
   }
   textarea { resize:vertical; min-height:3.2rem; }
+  select { appearance:none; cursor:pointer; }
+  select option { background:var(--panel-2); color:var(--ink); }
   input[type=range] { width:100%; accent-color:var(--accent); }
   .field + .field { margin-top:1rem; }
   .hint { font-size:.79rem; color:var(--ink-3); margin:.45rem 0 0; }
@@ -111,7 +113,7 @@
   <header>
     <div>
       <h1>On-chain LLM console</h1>
-      <p class="sub">A 260K-parameter transformer executing as EVM opcodes. Every token is computed on chain.</p>
+      <p class="sub"><span id="subModel">A transformer</span> executing as EVM opcodes. Every token is computed on chain.</p>
     </div>
     <div style="display:flex; gap:.55rem; align-items:center;">
       <span class="badge">Base Sepolia</span>
@@ -123,6 +125,21 @@
 
     <!-- ---------------- left: controls ---------------- -->
     <div>
+      <div class="panel">
+        <h2>Model</h2>
+        <div class="field">
+          <select id="model">
+            <option value="0xc2ff49e48a5E7e2e472e6858610cF92BFbcd0e1C">
+              stories260K — 0.28M parameters, fast (~25s for 6 tokens)
+            </option>
+            <option value="0x676Ef269b1Fe68129cE7D8001349d6802b9E339e" selected>
+              stories15M — 15.19M parameters, fluent (~6min for 6 tokens)
+            </option>
+          </select>
+        </div>
+        <p class="hint" id="modelNote" style="margin:.4rem 0 0">—</p>
+      </div>
+
       <div class="panel">
         <h2>Prompt</h2>
         <div class="field">
@@ -145,11 +162,10 @@
       <div class="panel">
         <h2>What one transaction does</h2>
         <p class="hint" style="margin-top:0">
-          The model has <strong>5 layers</strong>. Each transaction computes exactly one of
-          them for the current token position, then writes the residual stream and that
-          layer's KV cache back to storage. A sixth transaction runs the classifier and
-          emits the token. A layer is split further still — projections, attention one KV
-          head at a time, then the feed-forward network in row-sized pieces — so that no
+          The model has <strong id="nLayersOut">—</strong> layers, and a position costs
+          <strong id="phasesOut">—</strong> phases. A layer is divided into projections,
+          attention one KV head at a time, and the feed-forward network in row-sized
+          pieces, so that no
           single piece can outgrow a transaction as context or model size increases. The
           exact count per token is read from the contract, not assumed.
         </p>

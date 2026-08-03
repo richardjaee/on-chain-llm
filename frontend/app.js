@@ -100,6 +100,37 @@ async function withFailover(fn) {
   throw lastErr;
 }
 const addr = () => ($("addr").value || DEFAULT_CONTRACT).trim();
+
+/* Switching models invalidates everything derived from the old one: its geometry, and
+ * the tokenizer chosen from its vocabulary. Both are re-read on the next Generate. */
+function selectModel(a) {
+  $("addr").value = a;
+  geom = null;
+  tokReady = false;
+  tok = makeTok512(TOK512_SPEC);
+  $("modelNote").textContent = "reading the model from chain…";
+  $("nLayersOut").textContent = "—";
+  $("phasesOut").textContent = "—";
+  $("subModel").textContent = "A transformer";
+  ownRun = false;
+  updateEstimate();
+  loadGeom().then(describeModel).then(refresh).catch((e) => {
+    $("modelNote").textContent = "could not read this contract: " + shortErr(e);
+  });
+}
+
+/** Put the model's own numbers into the page, so nothing here is a hardcoded claim. */
+function describeModel() {
+  const g = geom;
+  const params = g.vocab * g.dim + g.nLayers * (2 * g.dim * g.dim + 2 * g.kvd * g.dim + 3 * g.hidden * g.dim);
+  $("subModel").textContent = `A ${(params / 1e6).toFixed(2)}M-parameter transformer`;
+  $("nLayersOut").textContent = g.nLayers;
+  $("phasesOut").textContent = g.phasesPerPos;
+  $("modelNote").textContent =
+    `dim ${g.dim} · hidden ${g.hidden} · ${g.nLayers} layers · ${g.nHeads} heads / ${g.nKv} KV · ` +
+    `vocab ${g.vocab.toLocaleString()} · ${g.phasesPerPos} phases per token`;
+  updateEstimate();
+}
 function status(msg, cls) { $("status").textContent = msg; $("status").className = "status" + (cls ? " " + cls : ""); }
 
 /* ------------------------------- the feed ------------------------------ */
@@ -599,6 +630,9 @@ function updateEstimate() {
 
 window.addEventListener("DOMContentLoaded", () => {
   $("addr").value = DEFAULT_CONTRACT;
+  $("model").value = DEFAULT_CONTRACT;
+  $("model").onchange = (e) => selectModel(e.target.value);
+  selectModel(DEFAULT_CONTRACT);
   $("go").onclick = generate;
   $("stop").onclick = () => { cancel = true; $("stop").disabled = true; status("Stopping after this step…", "warn"); };
   $("refresh").onclick = refresh;

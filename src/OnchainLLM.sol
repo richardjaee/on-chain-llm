@@ -80,7 +80,6 @@ contract OnchainLLM {
     ///      they pack four to a slot as int64 lanes exactly like the KV cache.
     mapping(uint256 => uint256) private _scratch;
     uint256 private constant SCRATCH_AO = 1 << 128;
-    uint256 private constant SCRATCH_NORM = 2 << 128;
     uint256 private constant SCRATCH_GATE = 3 << 128;
 
     /// @dev High-water cost of each phase type, remembered across transactions.
@@ -313,13 +312,13 @@ contract OnchainLLM {
     ) private {
         uint256 l = layer;
         uint256 r0 = cursor;
-        if (r0 == 0) {
-            (bytes memory rw, Transformer.Layout memory ro) = Transformer.sliceRmsAtt(chunks, o, c, l);
-            Transformer.rmsnorm(rw, ro.rmsAtt, 0, b.resid, b.normed, c.dim);
-            _saveVec(SCRATCH_NORM, b.normed, 0, c.dim);
-        }
-        _loadVec(SCRATCH_NORM, b.normed, 0, c.dim);
-        uint256 n = _headAligned(Transformer.rowsPerPhase(macsPerPhase, c.dim, c.dim - r0), c.hs, c.dim - r0);
+        // Recomputed rather than checkpointed. `normed` is a pure function of the
+        // residual stream, which every transaction already loads into memory, so
+        // storing it buys nothing and costs a great deal: `dim` slots to write and a
+        // cold read of all of them in every transaction that follows. At dim 2048 the
+        // write alone is ~10M gas and put the first phase over the ceiling by itself.
+        _norm(chunks, o, c, b, l, true);
+        uint256 n = _packAligned(Transformer.rowsPerPhase(macsPerPhase, c.dim, c.dim - r0), c.dim - r0);
         (bytes memory w, Transformer.Layout memory s) = Transformer.sliceQRows(chunks, o, c, l, p, r0, n);
         Transformer.prepareQ(w, s, c, b, r0, n);
         _saveVec(0, b.query, r0, n);
@@ -340,10 +339,10 @@ contract OnchainLLM {
     ) private {
         uint256 l = layer;
         uint256 r0 = cursor;
-        _loadVec(SCRATCH_NORM, b.normed, 0, c.dim);
+        _norm(chunks, o, c, b, l, true);
         // W_k and W_v are both computed here, so this phase does twice the work a
         // single-matmul phase does and gets half the row budget.
-        uint256 n = _headAligned(Transformer.rowsPerPhase(macsPerPhase / 2, c.dim, c.kvd - r0), c.hs, c.kvd - r0);
+        uint256 n = _packAligned(Transformer.rowsPerPhase(macsPerPhase / 2, c.dim, c.kvd - r0), c.kvd - r0);
         (bytes memory w, Transformer.Layout memory s) = Transformer.sliceKvRows(chunks, o, c, l, p, r0, n);
         Transformer.prepareKv(w, s, c, b, r0, n);
         _storeKvRange(c, b, l, p, r0, n);
@@ -404,9 +403,6 @@ contract OnchainLLM {
         }
         cursor = r0 + n;
         if (cursor == c.dim) {
-            (bytes memory rw, Transformer.Layout memory ro) = Transformer.sliceRmsFfn(chunks, o, c, l);
-            Transformer.rmsnorm(rw, ro.rmsFfn, 0, b.resid, b.normed, c.dim);
-            _saveVec(SCRATCH_NORM, b.normed, 0, c.dim);
             phase = 4;
             cursor = 0;
         }
@@ -424,7 +420,7 @@ contract OnchainLLM {
         uint256 r0 = cursor;
         // W_1 and W_3 are both computed here, so half the row budget as above.
         uint256 n = _packAligned(Transformer.rowsPerPhase(macsPerPhase / 2, c.dim, c.hidden - r0), c.hidden - r0);
-        _loadVec(SCRATCH_NORM, b.normed, 0, c.dim);
+        _norm(chunks, o, c, b, l, false);
         (bytes memory w, Transformer.Layout memory s) = Transformer.sliceFfn1(chunks, o, c, l, r0, n);
         Transformer.projectFfn1(w, s, c, b, r0, n);
         _saveVec(SCRATCH_GATE, b.gate, r0, n);
@@ -460,6 +456,26 @@ contract OnchainLLM {
             layer = l + 1;
         }
         return true;
+    }
+
+    /// @dev RMSNorm the residual stream into `b.normed`, with the attention gains or
+    ///      the feed-forward ones. Cheap next to a matmul shard and far cheaper than
+    ///      keeping the result in storage between phases.
+    function _norm(
+        address[] memory pages,
+        Transformer.Layout memory o,
+        Transformer.Config memory c,
+        Transformer.Buffers memory b,
+        uint256 l,
+        bool att
+    ) private view {
+        if (att) {
+            (bytes memory w, Transformer.Layout memory s) = Transformer.sliceRmsAtt(pages, o, c, l);
+            Transformer.rmsnorm(w, s.rmsAtt, 0, b.resid, b.normed, c.dim);
+        } else {
+            (bytes memory w, Transformer.Layout memory s) = Transformer.sliceRmsFfn(pages, o, c, l);
+            Transformer.rmsnorm(w, s.rmsFfn, 0, b.resid, b.normed, c.dim);
+        }
     }
 
     /// @dev Save `len` values of `src` from `off`, packed four int64 lanes per slot.
@@ -509,13 +525,13 @@ contract OnchainLLM {
         uint256 reserve
     ) private {
         if (cursor == 0) {
-            (bytes memory rw, Transformer.Layout memory ro) = Transformer.sliceRmsFinal(chunks, o, c);
-            Transformer.rmsnorm(rw, ro.rmsFinal, 0, b.resid, b.normed, c.dim);
-            _saveVec(SCRATCH_NORM, b.normed, 0, c.dim);
             _bestVal = type(int256).min;
             _bestIdx = 0;
         }
-        _loadVec(SCRATCH_NORM, b.normed, 0, c.dim);
+        {
+            (bytes memory rw, Transformer.Layout memory ro) = Transformer.sliceRmsFinal(chunks, o, c);
+            Transformer.rmsnorm(rw, ro.rmsFinal, 0, b.resid, b.normed, c.dim);
+        }
 
         int256 bestVal = _bestVal;
         uint256 bestIdx = _bestIdx;

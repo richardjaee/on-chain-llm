@@ -5,7 +5,7 @@ libs = ["lib"]
 test = "test"
 # inference is multi-hundred-million-gas; tests need room and memory
 gas_limit = "18446744073709551615"
-memory_limit = 134217728
+memory_limit = 2147483648
 # The forward pass carries more live values than the legacy pipeline's 16 stack
 # slots allow; the IR pipeline schedules them properly and optimises better.
 via_ir = true

@@ -201,6 +201,35 @@ library Transformer {
         }
     }
 
+    /// @notice Rotate rows [r0, r0+n) only, which need not be whole heads.
+    /// @dev RoPE rotates a *pair* of adjacent values, so a shard boundary is legal
+    ///      anywhere even, not only on a head boundary. Requiring whole heads makes the
+    ///      smallest possible Q shard `hs` rows wide, which at dim 2048 and hs 128 is
+    ///      262k multiply-accumulates — past any per-transaction budget, and a width
+    ///      ceiling with no reason behind it. The angle depends on the position within
+    ///      the head, which is recoverable from the row index alone.
+    function ropeRows(
+        bytes memory w,
+        Layout memory o,
+        Config memory c,
+        int256[] memory v,
+        uint256 r0,
+        uint256 n,
+        uint256 pos
+    ) internal pure {
+        uint256 half = c.hs / 2;
+        uint256 rowOff = pos * half * 4;
+        for (uint256 i = r0; i < r0 + n; i += 2) {
+            uint256 q = (i % c.hs) / 2;
+            int256 cs = _i32(w, o.ropeCos + rowOff + q * 4);
+            int256 sn = _i32(w, o.ropeSin + rowOff + q * 4);
+            int256 v0 = v[i];
+            int256 v1 = v[i + 1];
+            v[i] = (v0 * cs - v1 * sn) >> 30;
+            v[i + 1] = (v0 * sn + v1 * cs) >> 30;
+        }
+    }
+
     /// @notice Rotate heads [h0, h1) only — used when Q/K are produced a shard at a time
     function ropeRange(
         bytes memory w,
@@ -604,7 +633,7 @@ library Transformer {
         pure
     {
         matmul(w, s.wq, n, 0, n, c.dim, b.normed, b.query, r0);
-        ropeRange(w, s, c, b.query, r0 / c.hs, (r0 + n) / c.hs, 0);
+        ropeRows(w, s, c, b.query, r0, n, 0);
     }
 
     /// @notice One K/V shard: rows [r0, r0+n) of W_k and W_v, K rotated in place
@@ -614,7 +643,7 @@ library Transformer {
     {
         matmul(w, s.wk, n, 0, n, c.dim, b.normed, b.key, r0);
         matmul(w, s.wv, n, 0, n, c.dim, b.normed, b.value, r0);
-        ropeRange(w, s, c, b.key, r0 / c.hs, (r0 + n) / c.hs, 0);
+        ropeRows(w, s, c, b.key, r0, n, 0);
     }
 
     /// @notice PREPARE: everything a layer does before attention

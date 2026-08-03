@@ -83,6 +83,14 @@ contract OnchainLLM {
     uint256 private constant SCRATCH_NORM = 2 << 128;
     uint256 private constant SCRATCH_GATE = 3 << 128;
 
+    /// @dev High-water cost of each phase type, remembered across transactions.
+    ///      Predicting the next phase from the most expensive one already run cannot
+    ///      work: phases differ by an order of magnitude and a transaction that has
+    ///      only seen cheap ones will happily start an expensive one it cannot finish.
+    ///      Keyed by phase index; ATTEND grows with position, so the stored figure is a
+    ///      lower bound and the guard carries margin over it.
+    mapping(uint256 => uint256) private _phaseCost;
+
     /// @dev An ATTEND phase covers the query heads that share one KV head (nHeads/nKv
     ///      under grouped-query attention). Splitting finer would make two phases read
     ///      the same KV slice, and that read is the part that grows with position.
@@ -207,15 +215,30 @@ contract OnchainLLM {
         // The measured cost also UNDER-estimates the next transaction: within one tx
         // the KV slots are warm (100 gas) where a fresh tx re-reads them cold (2100),
         // hence the additional margin.
-        uint256 worst = 0;
+        // The caller's reserve covers its own accounting, but not ours: returning from
+        // this loop writes the residual stream back, which is `dim` storage slots and
+        // therefore scales with the model. At dim 64 that is ~1.3M gas and a 400k
+        // reserve merely looks generous; at dim 256 it is ~5.1M and the transaction
+        // runs out after the loop has already decided it had room. The floor is
+        // derived from the model rather than trusted from the caller.
+        uint256 keep = reserve;
+        uint256 floorGas = uint256(c.dim) * 22_000;
+        if (keep < floorGas) keep = floorGas;
+
         uint256 ran = 0;
         bool residDirty = false;
         while (layer < c.nLayers) {
             uint256 before = gasleft();
-            if (ran > 0 && before < worst + worst / 3 + reserve) break;
+            uint256 ph = phase;
+            uint256 est = _phaseCost[ph];
+            // A phase never run before has no estimate, so it is not started speculatively;
+            // it becomes the first phase of the next transaction, where it has the whole
+            // budget. Anything that fits in a transaction still runs, and nothing is
+            // begun that cannot be finished.
+            if (ran > 0 && (est == 0 || before < est + est / 2 + keep)) break;
             if (_phase(chunks, o, c, b, p)) residDirty = true;
             uint256 cost = before - gasleft();
-            if (cost > worst) worst = cost;
+            if (cost > _phaseCost[ph]) _phaseCost[ph] = cost;
             unchecked {
                 ran += 1;
             }
@@ -318,7 +341,9 @@ contract OnchainLLM {
         uint256 l = layer;
         uint256 r0 = cursor;
         _loadVec(SCRATCH_NORM, b.normed, 0, c.dim);
-        uint256 n = _headAligned(Transformer.rowsPerPhase(macsPerPhase, c.dim, c.kvd - r0), c.hs, c.kvd - r0);
+        // W_k and W_v are both computed here, so this phase does twice the work a
+        // single-matmul phase does and gets half the row budget.
+        uint256 n = _headAligned(Transformer.rowsPerPhase(macsPerPhase / 2, c.dim, c.kvd - r0), c.hs, c.kvd - r0);
         (bytes memory w, Transformer.Layout memory s) = Transformer.sliceKvRows(chunks, o, c, l, p, r0, n);
         Transformer.prepareKv(w, s, c, b, r0, n);
         _storeKvRange(c, b, l, p, r0, n);
@@ -397,7 +422,8 @@ contract OnchainLLM {
     ) private {
         uint256 l = layer;
         uint256 r0 = cursor;
-        uint256 n = _packAligned(Transformer.rowsPerPhase(macsPerPhase, c.dim, c.hidden - r0), c.hidden - r0);
+        // W_1 and W_3 are both computed here, so half the row budget as above.
+        uint256 n = _packAligned(Transformer.rowsPerPhase(macsPerPhase / 2, c.dim, c.hidden - r0), c.hidden - r0);
         _loadVec(SCRATCH_NORM, b.normed, 0, c.dim);
         (bytes memory w, Transformer.Layout memory s) = Transformer.sliceFfn1(chunks, o, c, l, r0, n);
         Transformer.projectFfn1(w, s, c, b, r0, n);
@@ -493,12 +519,13 @@ contract OnchainLLM {
 
         int256 bestVal = _bestVal;
         uint256 bestIdx = _bestIdx;
-        uint256 worst = 0;
         uint256 ran = 0;
+        uint256 keep = reserve < 200_000 ? 200_000 : reserve;
 
         while (cursor < c.vocab) {
             uint256 before = gasleft();
-            if (ran > 0 && before < worst + worst / 3 + reserve) break;
+            uint256 est = _phaseCost[6];
+            if (ran > 0 && (est == 0 || before < est + est / 2 + keep)) break;
             uint256 r0 = cursor;
             uint256 n = Transformer.rowsPerPhase(macsPerPhase, c.dim, c.vocab - r0);
             (bytes memory w, Transformer.Layout memory s) = Transformer.sliceClassifyRows(chunks, o, c, r0, n);
@@ -511,7 +538,7 @@ contract OnchainLLM {
             }
             cursor = r0 + n;
             uint256 cost = before - gasleft();
-            if (cost > worst) worst = cost;
+            if (cost > _phaseCost[6]) _phaseCost[6] = cost;
             unchecked {
                 ran += 1;
             }
@@ -563,13 +590,24 @@ contract OnchainLLM {
     function phasesPerPosition() public view returns (uint256) {
         Transformer.Config memory c = config();
         uint256 perLayer = _chunkCount(c.dim, c.dim) // W_q
-            + _chunkCount(c.kvd, c.dim) // W_k / W_v
+            + _chunkCount2(c.kvd, c.dim) // W_k / W_v, two matmuls per phase
             + c.nKv // ATTEND, one phase per KV head
             + _chunkCount(c.dim, c.dim) // W_o
-            + _chunkCount(c.hidden, c.dim) // SwiGLU
+            + _chunkCount2(c.hidden, c.dim) // SwiGLU, two matmuls per phase
             + _chunkCount(c.dim, c.hidden); // W_2
         // The classifier is itself sharded over the vocabulary
         return perLayer * c.nLayers + _chunkCount(c.vocab, c.dim);
+    }
+
+    /// @dev As `_chunkCount`, for phases that run two matmuls and take half the budget
+    function _chunkCount2(uint256 rows, uint256 cols) private view returns (uint256 n) {
+        uint256 r = 0;
+        while (r < rows) {
+            r += _packAligned(Transformer.rowsPerPhase(macsPerPhase / 2, cols, rows - r), rows - r);
+            unchecked {
+                n += 1;
+            }
+        }
     }
 
     /// @dev Walk the same cursor the phases walk, so the count matches exactly

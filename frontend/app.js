@@ -48,7 +48,7 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 let provider = null, browserSigner = null, session = null;
-let running = false, cancel = false, sessionGas = 0n, feedCount = 0;
+let running = false, cancel = false, sessionGas = 0n, sessionTx = 0, feedCount = 0;
 /* The contract keeps whatever the last generation left in storage — possibly from
  * an earlier run or another person entirely. Showing that next to this page's
  * saved prompt implies a relationship that may not exist, so output is only
@@ -173,7 +173,10 @@ function paint(s, highlightTail) {
   if (!p && !t) $("storyOld").textContent = "…";
   $("mGen").textContent = s.genCount === undefined ? "–" : s.genCount;
   $("mPos").textContent = s.pos + " / " + s.maxPos;
+  // The contract counts layers executed, not transactions: `step` runs as many layers
+  // as the gas left allows, so steps outruns transactions whenever it fits two in one.
   $("mSteps").textContent = s.steps;
+  $("mTx").textContent = sessionTx || "–";
   $("mGas").textContent = sessionGas ? Number(sessionGas).toLocaleString() : "–";
   $("mDone").textContent = s.done ? "complete" : running ? "generating" : s.steps > 0 ? "paused" : "idle";
   $("mDone").className = "val " + (s.done ? "ok" : running ? "busy" : "");
@@ -187,6 +190,7 @@ function paintIdle(s) {
   $("mGen").textContent = "–";
   $("mPos").textContent = "–";
   $("mSteps").textContent = "–";
+  $("mTx").textContent = "–";
   $("mGas").textContent = "–";
   $("mDone").textContent = "idle";
   $("mDone").className = "val";
@@ -384,7 +388,7 @@ async function runSteps() {
     for (const t of batch) {
       try {
         const r = await t.wait();
-        sent++;
+        sent++; sessionTx++;
         sessionGas += r.gasUsed;
         const info = describeReceipt(r, t.hash);
         live = advance(live, info);
@@ -414,7 +418,7 @@ async function generate() {
   const maxNew = parseInt($("maxnew").value, 10);
   const txCount = (ids.length + maxNew) * 6;
 
-  running = true; cancel = false; sessionGas = 0n;
+  running = true; cancel = false; sessionGas = 0n; sessionTx = 0;
   $("go").disabled = true; $("stop").disabled = false;
   feedReset();
   try {

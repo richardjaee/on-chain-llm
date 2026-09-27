@@ -29,7 +29,9 @@ contract GenerationTest is Test {
             hs: 8,
             kvd: 32,
             shared: true,
-            invSqrtHs: uint64((uint256(1) << 64) / FixedPoint.isqrt(uint256(8) << 64))
+            invSqrtHs: uint64((uint256(1) << 64) / FixedPoint.isqrt(uint256(8) << 64)),
+            nExperts: 0,
+            topK: 0
         });
         lay = Transformer.layout(cfg);
     }

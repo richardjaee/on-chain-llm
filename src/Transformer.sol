@@ -32,6 +32,12 @@ library Transformer {
         uint32 kvd;
         bool shared;
         uint64 invSqrtHs; // 2^32 / sqrt(hs)
+        /// @dev Experts per layer. 0 or 1 is dense, and lays out byte for byte as before:
+        ///      a mixture's feed-forward tensors are the dense ones with an expert axis,
+        ///      so one expert is the dense case rather than a special case of it.
+        uint32 nExperts;
+        /// @dev Experts a token visits. Ignored when the layer is dense.
+        uint32 topK;
     }
 
     /// @notice Byte offsets of each tensor's shift table within the blob
@@ -50,11 +56,34 @@ library Transformer {
         uint256 wcls;
         uint256 ropeCos;
         uint256 ropeSin;
+        /// @dev Router scores, (nLayers * nExperts, dim). Absent when dense, in which
+        ///      case this is zero and nothing reads it.
+        uint256 router;
     }
 
     /// @dev Size of one tensor block: `rows` shift bytes plus rows*cols int16
     function blockSize(uint256 rows, uint256 cols) internal pure returns (uint256) {
         return rows + rows * cols * 2;
+    }
+
+    /// @notice Experts per layer, with dense expressed as one.
+    /// @dev Everything downstream multiplies by this rather than branching on it, which
+    ///      is what keeps one code path for both and stops the dense case rotting.
+    function experts(Config memory c) internal pure returns (uint256) {
+        return c.nExperts == 0 ? 1 : c.nExperts;
+    }
+
+    /// @notice First row of expert `e` of layer `l` in a per-expert feed-forward tensor.
+    /// @dev `rowsEach` is `hidden` for the gate and up projections, `dim` for down. The
+    ///      rows of one expert are contiguous, which is the whole point of the layout: a
+    ///      phase reads them with the same row-range slice a shard already uses, so an
+    ///      unvisited expert is bytes never copied and chunks never touched.
+    function expertRow(Config memory c, uint256 l, uint256 e, uint256 rowsEach)
+        internal
+        pure
+        returns (uint256)
+    {
+        return (l * experts(c) + e) * rowsEach;
     }
 
     /// @notice Derive every offset from the config; the layout is fully determined
@@ -75,12 +104,19 @@ library Transformer {
         at += blockSize(L * c.dim, c.dim);
         o.rmsFfn = at;
         at += blockSize(1, L * c.dim);
+        // The feed-forward carries an expert axis. `experts()` is 1 when dense, so every
+        // size below is unchanged for a dense model and the existing blobs stay valid.
+        uint256 E = experts(c);
+        if (E > 1) {
+            o.router = at;
+            at += blockSize(L * E, c.dim);
+        }
         o.w1 = at;
-        at += blockSize(L * c.hidden, c.dim);
+        at += blockSize(L * E * c.hidden, c.dim);
         o.w2 = at;
-        at += blockSize(L * c.dim, c.hidden);
+        at += blockSize(L * E * c.dim, c.hidden);
         o.w3 = at;
-        at += blockSize(L * c.hidden, c.dim);
+        at += blockSize(L * E * c.hidden, c.dim);
         o.rmsFinal = at;
         at += blockSize(1, c.dim);
         // A shared classifier reuses the embedding block; an unshared one gets its own
@@ -570,7 +606,14 @@ library Transformer {
             hs: c.hs,
             kvd: c.kvd,
             shared: c.shared,
-            invSqrtHs: c.invSqrtHs
+            invSqrtHs: c.invSqrtHs,
+            // Dense, deliberately: a slice holds the rows one phase reads, and for a
+            // mixture that is the chosen experts rather than all of them, so the count
+            // here is a property of the slice and not of the model. Dispatch sets it
+            // when it builds the slice; until then nothing reads a mixture and zero is
+            // the honest answer.
+            nExperts: 0,
+            topK: 0
         });
     }
 

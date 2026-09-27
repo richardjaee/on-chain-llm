@@ -81,7 +81,9 @@ contract ScaleTest is Test {
             hs: dim / heads,
             kvd: (dim / heads) * kv,
             shared: true,
-            invSqrtHs: 0
+            invSqrtHs: 0,
+            nExperts: 0,
+            topK: 0
         });
         console2.log("dim", cfg.dim, "hidden", cfg.hidden);
         llm = new OnchainLLM(WeightStore.write(dir), cfg, vm.envOr("MACS", uint256(0)));

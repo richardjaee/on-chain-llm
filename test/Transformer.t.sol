@@ -32,7 +32,9 @@ contract TransformerTest is Test {
             hs: 8,
             kvd: 32,
             shared: true,
-            invSqrtHs: uint64((uint256(1) << 32) / 2) // 1/sqrt(8) handled below
+            invSqrtHs: uint64((uint256(1) << 32) / 2), // 1/sqrt(8) handled below
+            nExperts: 0,
+            topK: 0
         });
         // 2^32 / sqrt(8), computed with the same integer sqrt the model uses
         cfg.invSqrtHs = uint64((uint256(1) << 64) / FixedPoint.isqrt(uint256(8) << 64));

@@ -66,7 +66,9 @@ contract ResumableTest is Test {
             hs: 8,
             kvd: 32,
             shared: true,
-            invSqrtHs: 0
+            invSqrtHs: 0,
+            nExperts: 0,
+            topK: 0
         });
         dirPtr = WeightStore.write(dir);
         cfg = c;

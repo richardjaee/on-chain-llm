@@ -130,6 +130,11 @@ library Transformer {
         // once and unpacks all sixteen rather than issuing an mload per weight. That
         // removes fifteen of every sixteen memory reads from the hottest loop in the
         // model; the tail handles a column count that is not a multiple of sixteen.
+        //
+        // A lane is extracted by shifting it to the top of the word and letting `sar`
+        // carry the sign down, rather than by `shr` followed by `signextend`. Both
+        // produce the same int16; `signextend` costs 5 gas and `sar` costs 3, so the
+        // pair is 6 gas where it was 8, and the top lane needs no shift at all.
         assembly ("memory-safe") {
             let wp := add(w, 0x20)
             let shiftBase := add(wp, base)
@@ -149,22 +154,22 @@ library Transformer {
                     let word := mload(add(rp, shl(1, j)))
                     let xj := add(xp, shl(5, j))
                     // unrolled: constant shifts, no inner loop counter
-                    acc := add(acc, mul(signextend(1, shr(240, word)), mload(add(xj, 0))))
-                    acc := add(acc, mul(signextend(1, shr(224, word)), mload(add(xj, 32))))
-                    acc := add(acc, mul(signextend(1, shr(208, word)), mload(add(xj, 64))))
-                    acc := add(acc, mul(signextend(1, shr(192, word)), mload(add(xj, 96))))
-                    acc := add(acc, mul(signextend(1, shr(176, word)), mload(add(xj, 128))))
-                    acc := add(acc, mul(signextend(1, shr(160, word)), mload(add(xj, 160))))
-                    acc := add(acc, mul(signextend(1, shr(144, word)), mload(add(xj, 192))))
-                    acc := add(acc, mul(signextend(1, shr(128, word)), mload(add(xj, 224))))
-                    acc := add(acc, mul(signextend(1, shr(112, word)), mload(add(xj, 256))))
-                    acc := add(acc, mul(signextend(1, shr(96, word)), mload(add(xj, 288))))
-                    acc := add(acc, mul(signextend(1, shr(80, word)), mload(add(xj, 320))))
-                    acc := add(acc, mul(signextend(1, shr(64, word)), mload(add(xj, 352))))
-                    acc := add(acc, mul(signextend(1, shr(48, word)), mload(add(xj, 384))))
-                    acc := add(acc, mul(signextend(1, shr(32, word)), mload(add(xj, 416))))
-                    acc := add(acc, mul(signextend(1, shr(16, word)), mload(add(xj, 448))))
-                    acc := add(acc, mul(signextend(1, shr(0, word)), mload(add(xj, 480))))
+                    acc := add(acc, mul(sar(240, word), mload(add(xj, 0))))
+                    acc := add(acc, mul(sar(240, shl(16, word)), mload(add(xj, 32))))
+                    acc := add(acc, mul(sar(240, shl(32, word)), mload(add(xj, 64))))
+                    acc := add(acc, mul(sar(240, shl(48, word)), mload(add(xj, 96))))
+                    acc := add(acc, mul(sar(240, shl(64, word)), mload(add(xj, 128))))
+                    acc := add(acc, mul(sar(240, shl(80, word)), mload(add(xj, 160))))
+                    acc := add(acc, mul(sar(240, shl(96, word)), mload(add(xj, 192))))
+                    acc := add(acc, mul(sar(240, shl(112, word)), mload(add(xj, 224))))
+                    acc := add(acc, mul(sar(240, shl(128, word)), mload(add(xj, 256))))
+                    acc := add(acc, mul(sar(240, shl(144, word)), mload(add(xj, 288))))
+                    acc := add(acc, mul(sar(240, shl(160, word)), mload(add(xj, 320))))
+                    acc := add(acc, mul(sar(240, shl(176, word)), mload(add(xj, 352))))
+                    acc := add(acc, mul(sar(240, shl(192, word)), mload(add(xj, 384))))
+                    acc := add(acc, mul(sar(240, shl(208, word)), mload(add(xj, 416))))
+                    acc := add(acc, mul(sar(240, shl(224, word)), mload(add(xj, 448))))
+                    acc := add(acc, mul(sar(240, shl(240, word)), mload(add(xj, 480))))
                 }
                 // tail: fewer than sixteen columns remain, so walk the final word's
                 // leading lanes with the same shift arithmetic as above
@@ -172,7 +177,7 @@ library Transformer {
                     let tailWord := mload(add(rp, shl(1, whole)))
                     let xt := add(xp, shl(5, whole))
                     for { let k := 0 } lt(k, sub(cols, whole)) { k := add(k, 1) } {
-                        let lane := signextend(1, shr(sub(240, shl(4, k)), tailWord))
+                        let lane := sar(240, shl(shl(4, k), tailWord))
                         acc := add(acc, mul(lane, mload(add(xt, shl(5, k)))))
                     }
                 }

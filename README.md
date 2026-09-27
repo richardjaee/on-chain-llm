@@ -162,6 +162,14 @@ transaction, the wall moved from position 48 to **286**; `test_FindStrandPositio
 What remains is the cold read of the KV cache itself, which is linear in position — the
 next step is splitting ATTEND over the KV range, in two passes so it stays exact.
 
+A second lever on the same wall is narrowing the cache. Cached values are Q32 in `int64`,
+four to a slot; at Q16 in `int32` they pack eight, halving both the per-position write and
+the cold read that binds position. The range is there for it: bisecting the `KvOverflow`
+guard against `Resumable` puts the largest cached magnitude between **16.2 and 32**, where
+Q16 in `int32` reaches 32,768 — about three orders of magnitude of headroom. What it costs
+is resolution, 1.5e-5 against Q32's 2.3e-10, so it changes what the model computes and
+every pinned vector with it. Worth doing, not worth doing quietly.
+
 Note that the usual answer here — FlashAttention-style online softmax — is the wrong tool.
 Its rescaling exists to make attention single-pass, which is unnecessary when state is
 already checkpointed between transactions, and the rescaling multiplications would break

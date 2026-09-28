@@ -796,28 +796,59 @@ library Transformer {
     }
 
     /// @notice Weights for a SwiGLU shard: W_1 and W_3 rows [r0, r0+n), plus rms_ffn
-    function sliceFfn1(address[] memory pages, Layout memory o, Config memory c, uint256 l, uint256 r0, uint256 n)
-        internal
-        view
-        returns (bytes memory data, Layout memory s)
-    {
+    /// @param e Expert to read. Zero for a dense layer, where `expertRow` collapses to
+    ///          `l * hidden` and the row total to `nLayers * hidden` — the expressions
+    ///          this function used before there was an expert axis.
+    function sliceFfn1(
+        address[] memory pages,
+        Layout memory o,
+        Config memory c,
+        uint256 l,
+        uint256 e,
+        uint256 r0,
+        uint256 n
+    ) internal view returns (bytes memory data, Layout memory s) {
         uint256 one = blockSize(n, c.dim);
+        uint256 total = uint256(c.nLayers) * experts(c) * c.hidden;
+        uint256 row = expertRow(c, l, e, c.hidden) + r0;
         data = new bytes(one * 2 + SLICE_PAD);
         s.w1 = 0;
-        _sliceRows(pages, data, 0, o.w1, uint256(c.nLayers) * c.hidden, l * c.hidden + r0, n, c.dim);
+        _sliceRows(pages, data, 0, o.w1, total, row, n, c.dim);
         s.w3 = one;
-        _sliceRows(pages, data, one, o.w3, uint256(c.nLayers) * c.hidden, l * c.hidden + r0, n, c.dim);
+        _sliceRows(pages, data, one, o.w3, total, row, n, c.dim);
     }
 
     /// @notice Weights for a W_2 shard: rows [r0, r0+n)
-    function sliceFfn2(address[] memory pages, Layout memory o, Config memory c, uint256 l, uint256 r0, uint256 n)
+    /// @param e Expert to read; see `sliceFfn1`.
+    function sliceFfn2(
+        address[] memory pages,
+        Layout memory o,
+        Config memory c,
+        uint256 l,
+        uint256 e,
+        uint256 r0,
+        uint256 n
+    ) internal view returns (bytes memory data, Layout memory s) {
+        data = new bytes(blockSize(n, c.hidden) + SLICE_PAD);
+        s.w2 = 0;
+        _sliceRows(
+            pages, data, 0, o.w2, uint256(c.nLayers) * experts(c) * c.dim, expertRow(c, l, e, c.dim) + r0, n, c.hidden
+        );
+    }
+
+    /// @notice The router rows for layer `l`: one score per expert, from the residual.
+    /// @dev The one read a mixture pays that a dense layer does not, and it is small —
+    ///      `nExperts` rows of `dim`, against an expert's `hidden` rows. Choosing 8 of
+    ///      128 costs this plus eight experts, not one hundred and twenty-eight.
+    function sliceRouter(address[] memory pages, Layout memory o, Config memory c, uint256 l)
         internal
         view
         returns (bytes memory data, Layout memory s)
     {
-        data = new bytes(blockSize(n, c.hidden) + SLICE_PAD);
-        s.w2 = 0;
-        _sliceRows(pages, data, 0, o.w2, uint256(c.nLayers) * c.dim, l * c.dim + r0, n, c.hidden);
+        uint256 E = experts(c);
+        data = new bytes(blockSize(E, c.dim) + SLICE_PAD);
+        s.router = 0;
+        _sliceRows(pages, data, 0, o.router, uint256(c.nLayers) * E, l * E, E, c.dim);
     }
 
     /// @notice The rms_ffn gains for one layer, as a single-row block

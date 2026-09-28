@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import {Decoder} from "./Decoder.sol";
 import {FixedPoint} from "./FixedPoint.sol";
+import {Mixture} from "./Mixture.sol";
 import {Transformer} from "./Transformer.sol";
 import {WeightStore} from "./WeightStore.sol";
 
@@ -32,6 +33,10 @@ contract OnchainLLM {
     uint32 private immutable _vocab;
     uint32 private immutable _seqLen;
     bool private immutable _shared;
+    /// @dev Experts per layer and how many a token visits. Zero experts is dense, and a
+    ///      dense contract behaves exactly as one deployed before there was an axis.
+    uint32 private immutable _nExperts;
+    uint32 private immutable _topK;
 
     /// @notice Multiply-accumulates a sharded matmul phase aims for. Lower means more,
     ///         smaller transactions — the right value depends on the chain's per
@@ -80,6 +85,19 @@ contract OnchainLLM {
     mapping(uint256 => uint256) private _kv;
     uint256 private constant PACK_N = 4;
 
+    /// @dev Which experts this position's feed-forward visits, and how much each counts.
+    ///      Both must cross transactions: the router runs once, in its own phase, and the
+    ///      experts it picked are then walked over many. Packed into single slots because
+    ///      `topK` is small — eight experts is four bytes of index and eight Q32 weights.
+    ///      `_slot` is how far through that list the walk has got.
+    uint256 private _chosenPacked;
+    uint256 private _weightPacked;
+    uint256 public slot;
+
+    /// @dev Indices pack 8 to a slot as uint32 lanes; weights 4 as int64, like the KV
+    ///      cache. A top-k beyond those is refused at start() rather than truncated here.
+    uint256 private constant MAX_TOPK = 4;
+
     /// @dev State that must survive between phases of one layer: the post-RoPE query,
     ///      and the attention output as heads fill it in. Both are Q32 activations, so
     ///      they pack four to a slot as int64 lanes exactly like the KV cache.
@@ -108,6 +126,7 @@ contract OnchainLLM {
     error AlreadyFinished();
     error PromptTooLong();
     error KvOverflow(int256 value);
+    error TopKUnsupported(uint32 topK);
 
     constructor(address directory_, Transformer.Config memory c, uint256 macsPerPhase_) {
         directory = directory_;
@@ -120,6 +139,14 @@ contract OnchainLLM {
         _vocab = c.vocab;
         _seqLen = c.seqLen;
         _shared = c.shared;
+        _nExperts = c.nExperts;
+        _topK = c.topK;
+        if (c.nExperts > 1) {
+            // A larger top-k would silently lose experts off the end of the packed slots,
+            // which is a wrong answer rather than a slow one. Refuse it at construction.
+            if (c.topK == 0 || c.topK > MAX_TOPK) revert TopKUnsupported(c.topK);
+            if (c.topK > c.nExperts) revert TopKUnsupported(c.topK);
+        }
     }
 
     function config() public view returns (Transformer.Config memory c) {
@@ -135,6 +162,8 @@ contract OnchainLLM {
         c.shared = _shared;
         // 2^32 / sqrt(hs), via the same integer sqrt the model uses
         c.invSqrtHs = uint64((uint256(1) << 64) / FixedPoint.isqrt(uint256(c.hs) << 64));
+        c.nExperts = _nExperts;
+        c.topK = _topK;
     }
 
     /// @notice Begin a generation from a pre-tokenised prompt
@@ -291,11 +320,44 @@ contract OnchainLLM {
             return false;
         }
         if (ph == 3) return _phaseWo(chunks, o, c, b);
+
+        // A dense layer keeps the ladder it was deployed with: 4 is the feed-forward's
+        // first half, 5 its second. A mixture inserts routing at 4 and shifts both by
+        // one, so the two never share a numbering and a dense blob cannot be read as a
+        // mixture by accident.
+        if (Transformer.experts(c) == 1) {
+            if (ph == 4) {
+                _phaseFfn1(chunks, o, c, b, 0);
+                return false;
+            }
+            return _phaseFfn2(chunks, o, c, b, 0, FixedPoint.ONE, true);
+        }
+
         if (ph == 4) {
-            _phaseFfn1(chunks, o, c, b);
+            _phaseRoute(chunks, o, c, b);
             return false;
         }
-        return _phaseFfn2(chunks, o, c, b);
+        (uint256 e, int256 weight, bool last) = _current(c);
+        if (ph == 5) {
+            _phaseFfn1(chunks, o, c, b, e);
+            return false;
+        }
+        return _phaseFfn2(chunks, o, c, b, e, weight, last);
+    }
+
+    /// @dev The expert the walk is on, its routing weight, and whether it is the last.
+    function _current(Transformer.Config memory c) private view returns (uint256, int256, bool) {
+        uint256 i = slot;
+        uint256 k = c.topK;
+        return (_chosen(i), _weight(i), i + 1 == k);
+    }
+
+    function _chosen(uint256 i) private view returns (uint256) {
+        return uint256(uint32(_chosenPacked >> (32 * i)));
+    }
+
+    function _weight(uint256 i) private view returns (int256) {
+        return int256(int64(uint64(_weightPacked >> (64 * i))));
     }
 
     /// @dev A shard must be a whole number of heads, so RoPE lands on heads this shard
@@ -425,19 +487,20 @@ contract OnchainLLM {
         address[] memory chunks,
         Transformer.Layout memory o,
         Transformer.Config memory c,
-        Transformer.Buffers memory b
+        Transformer.Buffers memory b,
+        uint256 e
     ) private {
         uint256 l = layer;
         uint256 r0 = cursor;
         // W_1 and W_3 are both computed here, so half the row budget as above.
         uint256 n = _packAligned(Transformer.rowsPerPhase(macsPerPhase / 2, c.dim, c.hidden - r0), c.hidden - r0);
         _norm(chunks, o, c, b, l, false);
-        (bytes memory w, Transformer.Layout memory s) = Transformer.sliceFfn1(chunks, o, c, l, r0, n);
+        (bytes memory w, Transformer.Layout memory s) = Transformer.sliceFfn1(chunks, o, c, l, e, r0, n);
         Transformer.projectFfn1(w, s, c, b, r0, n);
         _saveVec(SCRATCH_GATE, b.gate, r0, n);
         cursor = r0 + n;
         if (cursor == c.hidden) {
-            phase = 5;
+            phase = Transformer.experts(c) == 1 ? 5 : 6;
             cursor = 0;
         }
     }
@@ -445,28 +508,89 @@ contract OnchainLLM {
     /// @dev W_2 shard, back into the residual stream. Row i of W_2 reads the whole of
     ///      `gate`, so every shard loads all of it — the one place this decomposition
     ///      pays an O(hidden) read per phase rather than a slice.
+    /// @param weight This expert's share, Q32. `ONE` for a dense layer, where the scaling
+    ///               below is an exact identity and the arithmetic is unchanged.
+    /// @param last Whether the layer ends when this expert finishes. A mixture walks its
+    ///             chosen experts one after another, each adding into the same residual.
     function _phaseFfn2(
         address[] memory chunks,
         Transformer.Layout memory o,
         Transformer.Config memory c,
-        Transformer.Buffers memory b
+        Transformer.Buffers memory b,
+        uint256 e,
+        int256 weight,
+        bool last
     ) private returns (bool) {
         uint256 l = layer;
         uint256 r0 = cursor;
         uint256 n = _packAligned(Transformer.rowsPerPhase(macsPerPhase, c.hidden, c.dim - r0), c.dim - r0);
         _loadVec(SCRATCH_GATE, b.gate, 0, c.hidden);
-        (bytes memory w, Transformer.Layout memory s) = Transformer.sliceFfn2(chunks, o, c, l, r0, n);
+        (bytes memory w, Transformer.Layout memory s) = Transformer.sliceFfn2(chunks, o, c, l, e, r0, n);
         Transformer.projectFfn2(w, s, c, b, r0, n);
-        for (uint256 i = r0; i < r0 + n; ++i) {
-            b.resid[i] += b.proj[i];
+        if (weight == FixedPoint.ONE) {
+            // The dense path, byte for byte as deployed: multiplying by one and shifting
+            // back is an identity, but only if nothing rounds, and this way nothing can.
+            for (uint256 i = r0; i < r0 + n; ++i) {
+                b.resid[i] += b.proj[i];
+            }
+        } else {
+            for (uint256 i = r0; i < r0 + n; ++i) {
+                b.resid[i] += (b.proj[i] * weight) >> FixedPoint.F;
+            }
         }
         cursor = r0 + n;
         if (cursor == c.dim) {
-            phase = 0;
             cursor = 0;
-            layer = l + 1;
+            if (last) {
+                phase = 0;
+                slot = 0;
+                layer = l + 1;
+            } else {
+                // Back to this layer's first feed-forward phase for the next expert.
+                phase = 5;
+                slot += 1;
+            }
         }
         return true;
+    }
+
+    /// @dev Choose this position's experts and their weights, once, before any of them
+    ///      runs. The scores come from the residual after the feed-forward norm — the
+    ///      same vector the experts themselves consume — so routing sees exactly what
+    ///      they will. Persisted because the walk that follows spans transactions.
+    function _phaseRoute(
+        address[] memory chunks,
+        Transformer.Layout memory o,
+        Transformer.Config memory c,
+        Transformer.Buffers memory b
+    ) private {
+        uint256 l = layer;
+        uint256 E = Transformer.experts(c);
+        _norm(chunks, o, c, b, l, false);
+
+        (bytes memory w, Transformer.Layout memory s) = Transformer.sliceRouter(chunks, o, c, l);
+        int256[] memory scores = new int256[](E);
+        Transformer.matmul(w, s.router, E, 0, E, c.dim, b.normed, scores, 0);
+
+        (uint256[] memory idx, int256[] memory val) = Mixture.topK(scores, c.topK);
+        int256[] memory weights = Mixture.routeWeights(val);
+        uint256[] memory order = Mixture.visitOrder(idx);
+
+        // Stored in visit order, so the walk is a straight index rather than a lookup
+        // through a permutation it would have to re-derive every transaction.
+        uint256 packedIdx;
+        uint256 packedW;
+        for (uint256 i = 0; i < order.length; ++i) {
+            uint256 from = order[i];
+            packedIdx |= uint256(uint32(idx[from])) << (32 * i);
+            packedW |= uint256(uint64(int64(weights[from]))) << (64 * i);
+        }
+        _chosenPacked = packedIdx;
+        _weightPacked = packedW;
+
+        slot = 0;
+        phase = 5;
+        cursor = 0;
     }
 
     /// @dev RMSNorm the residual stream into `b.normed`, with the attention gains or

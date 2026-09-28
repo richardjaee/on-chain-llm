@@ -35,9 +35,35 @@ const E = require(path.join(FRONTEND, "ethers.umd.min.js"));
 const { makeLlamaTok } = require(path.join(FRONTEND, "_tok_llama.js"));
 
 const PORT = Number(process.env.PORT || 8787);
-const RPC = process.env.RPC || "https://sepolia.base.org";
-const EXPLORER = "https://sepolia.basescan.org";
-const CHAIN = "base-sepolia";
+
+/**
+ * Two places the same model can run, and they are not interchangeable.
+ *
+ * `verified` is a public chain: slow, costs gas, and produces a link anyone can click.
+ * `dev` is a local fork of it — the same deployed contract and the same weights, read
+ * through anvil — which is free and lets a transaction carry as much work as you allow
+ * rather than the ~15M gas a public RPC accepts. Thirty-four phases a transaction
+ * instead of one, measured.
+ *
+ * What `dev` cannot do is prove anything. Those transactions exist on one laptop. So it
+ * reports `verified: false` and says why, rather than producing a receipt that looks like
+ * the real one. A sandbox that claims what production claims is worse than no sandbox.
+ */
+const CHAINS = {
+  verified: {
+    rpc: process.env.RPC || "https://sepolia.base.org",
+    explorer: "https://sepolia.basescan.org",
+    name: "base-sepolia",
+    verified: true,
+  },
+  dev: {
+    rpc: process.env.DEV_RPC || "http://127.0.0.1:8545",
+    explorer: null,
+    name: "base-sepolia-fork (local)",
+    verified: false,
+  },
+};
+const DEFAULT_CHAIN = "verified";
 
 /** Deployed models. The tokenizer is a property of the model, not of this server. */
 const MODELS = {
@@ -65,8 +91,17 @@ const ABI = [
   "function maxPos() view returns (uint256)",
 ];
 
-const provider = new E.JsonRpcProvider(RPC);
-const wallet = process.env.PRIVATE_KEY ? new E.Wallet(process.env.PRIVATE_KEY, provider) : null;
+/** anvil's first account, funded and well known. Only ever used against `dev`. */
+const ANVIL_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+function connect(which) {
+  const ch = CHAINS[which];
+  const provider = new E.JsonRpcProvider(ch.rpc);
+  // A local fork is funded by definition, so `dev` needs no key from anyone. The public
+  // chain needs a real one, and without it the server reads rather than writes.
+  const key = which === "dev" ? process.env.DEV_PRIVATE_KEY || ANVIL_KEY : process.env.PRIVATE_KEY;
+  return { ch, provider, wallet: key ? new E.Wallet(key, provider) : null };
+}
 
 let tok = null;
 function tokenizer() {
@@ -81,21 +116,24 @@ function tokenizer() {
 const jobs = new Map();
 let nextId = 1;
 
-function proof(address, extra = {}) {
+function proof(ch, address, extra = {}) {
   return {
-    verified: true,
-    claim:
-      "This completion was computed by the contract below, on chain. Anyone can " +
-      "re-execute it and get identical bits. It is not a claim that the output is true.",
-    chain: CHAIN,
+    verified: ch.verified,
+    claim: ch.verified
+      ? "This completion was computed by the contract below, on chain. Anyone can " +
+        "re-execute it and get identical bits. It is not a claim that the output is true."
+      : "Computed on a local fork. The weights and the contract are the deployed ones, " +
+        "but these transactions exist only on this machine, so nothing here is evidence " +
+        "to anyone else. Use the verified chain when the receipt is the point.",
+    chain: ch.name,
     contract: address,
-    explorer: `${EXPLORER}/address/${address}`,
+    explorer: ch.explorer ? `${ch.explorer}/address/${address}` : null,
     ...extra,
   };
 }
 
 /** The generation already sitting in the contract — what a read-only server can serve. */
-async function readCompleted(model) {
+async function readCompleted(model, ch, provider) {
   const c = new E.Contract(model.address, ABI, provider);
   const [text, ids, finished, steps, block] = await Promise.all([
     c.text(),
@@ -107,7 +145,7 @@ async function readCompleted(model) {
   return {
     text,
     tokens: ids.map(Number),
-    onchain: proof(model.address, {
+    onchain: proof(ch, model.address, {
       finished,
       steps: Number(steps),
       read_at_block: block,
@@ -116,12 +154,15 @@ async function readCompleted(model) {
   };
 }
 
-async function drive(job, model, ids, maxNew) {
+async function drive(job, model, ids, maxNew, ch, provider, wallet) {
   const c = new E.Contract(model.address, ABI, wallet);
+  // A local fork has no meaningful ceiling, so one transaction carries many phases
+  // instead of one. This is the whole reason `dev` is worth having.
+  const opts = ch.verified ? {} : { gasLimit: 300_000_000n };
   const txs = [];
   try {
     job.status = "starting";
-    const st = await c.start(ids, maxNew);
+    const st = await c.start(ids, maxNew, opts);
     txs.push(st.hash);
     await st.wait();
 
@@ -130,7 +171,7 @@ async function drive(job, model, ids, maxNew) {
     // it is done. A reserve of zero lets each transaction use what the node will give it.
     for (let i = 0; i < 20000; ++i) {
       if (await c.finished()) break;
-      const t = await c.step(0);
+      const t = await c.step(0, opts);
       txs.push(t.hash);
       await t.wait();
       job.steps = txs.length;
@@ -142,17 +183,17 @@ async function drive(job, model, ids, maxNew) {
     job.result = {
       text,
       tokens: gen.map(Number),
-      onchain: proof(model.address, {
+      onchain: proof(ch, model.address, {
         transactions: txs,
         transaction_count: txs.length,
         block: blk,
-        first_transaction: txs.length ? `${EXPLORER}/tx/${txs[0]}` : null,
+          first_transaction: txs.length && ch.explorer ? `${ch.explorer}/tx/${txs[0]}` : null,
       }),
     };
   } catch (err) {
     job.status = "error";
     job.error = String(err.shortMessage || err.message || err);
-    job.result = { onchain: proof(model.address, { transactions: txs }) };
+    job.result = { onchain: proof(ch, model.address, { transactions: txs }) };
   }
 }
 
@@ -183,9 +224,9 @@ const server = http.createServer(async (req, res) => {
         id,
         object: "model",
         owned_by: "on-chain-llm",
-        chain: CHAIN,
         contract: m.address,
-        explorer: `${EXPLORER}/address/${m.address}`,
+        chains: Object.keys(CHAINS),
+        explorer: `${CHAINS.verified.explorer}/address/${m.address}`,
       })),
     });
   }
@@ -198,10 +239,16 @@ const server = http.createServer(async (req, res) => {
     const model = MODELS[name];
     if (!model) return send(res, 404, { error: { message: `unknown model ${name}` } });
 
+    const which = b.chain || DEFAULT_CHAIN;
+    if (!CHAINS[which]) {
+      return send(res, 400, { error: { message: `unknown chain ${which}`, chains: Object.keys(CHAINS) } });
+    }
+    const { ch, provider, wallet } = connect(which);
+
     // No key means no transactions to sign, so the honest thing is to serve what the
     // contract already holds and say so, rather than pretend to have generated it.
     if (!wallet) {
-      const done = await readCompleted(model);
+      const done = await readCompleted(model, ch, provider);
       return send(res, 200, {
         object: "text_completion",
         model: name,
@@ -218,19 +265,23 @@ const server = http.createServer(async (req, res) => {
     if (!ids.length) return send(res, 400, { error: { message: "empty prompt" } });
 
     const id = `cmpl-${nextId++}`;
-    const job = { id, model: name, status: "queued", created: Date.now(), steps: 0, pos: 0 };
+    const job = { id, model: name, chain: ch.name, status: "queued", created: Date.now(), steps: 0, pos: 0 };
     jobs.set(id, job);
-    drive(job, model, ids, Number(b.max_tokens || 6));
+    drive(job, model, ids, Number(b.max_tokens || 6), ch, provider, wallet);
 
     return send(res, 202, {
       id,
       object: "text_completion.job",
       model: name,
+      chain: ch.name,
+      verified: ch.verified,
       status: job.status,
       poll: `/v1/completions/${id}`,
-      note:
-        "Generation runs as transactions on a public chain and takes minutes, not " +
-        "milliseconds. Poll the URL above.",
+      note: ch.verified
+        ? "Generation runs as transactions on a public chain and takes minutes, not " +
+          "milliseconds. Poll the URL above."
+        : "Generation runs against a local fork: free, and one transaction carries many " +
+          "phases rather than one. Still minutes, and it proves nothing to anyone else.",
     });
   }
 
@@ -241,6 +292,7 @@ const server = http.createServer(async (req, res) => {
       id: job.id,
       object: "text_completion",
       model: job.model,
+      chain: job.chain,
       status: job.status,
       progress: { transactions: job.steps, position: job.pos },
     };
@@ -257,7 +309,9 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`on-chain-llm  ->  http://localhost:${PORT}`);
-  console.log(`  chain   ${CHAIN} via ${RPC}`);
-  console.log(`  model   ${DEFAULT_MODEL} at ${MODELS[DEFAULT_MODEL].address}`);
-  console.log(`  signer  ${wallet ? wallet.address : "none (read-only; set PRIVATE_KEY)"}`);
+  console.log(`  model    ${DEFAULT_MODEL} at ${MODELS[DEFAULT_MODEL].address}`);
+  for (const [k, c] of Object.entries(CHAINS)) {
+    const w = connect(k).wallet;
+    console.log(`  ${k.padEnd(8)} ${c.rpc}  ${w ? "signer " + w.address.slice(0, 10) : "read-only"}`);
+  }
 });

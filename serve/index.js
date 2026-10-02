@@ -58,6 +58,10 @@ const CHAINS = {
   },
   dev: {
     rpc: process.env.DEV_RPC || "http://127.0.0.1:8545",
+    // No explorer, which is not the same as no transactions. They are ordinary
+    // transactions in an ordinary node and every one can be read back over JSON-RPC;
+    // what a local fork lacks is a website, so the response hands back the hashes and
+    // the command that shows them instead of a link that would not resolve.
     explorer: null,
     name: "base-sepolia-fork (local)",
     verified: false,
@@ -125,6 +129,14 @@ function proof(ch, address, extra = {}) {
       : "Computed on a local fork. The weights and the contract are the deployed ones, " +
         "but these transactions exist only on this machine, so nothing here is evidence " +
         "to anyone else. Use the verified chain when the receipt is the point.",
+    inspect: ch.explorer
+      ? undefined
+      : {
+          rpc: ch.rpc,
+          how: "cast tx <hash> --rpc-url " + ch.rpc,
+          receipt: "cast receipt <hash> --rpc-url " + ch.rpc,
+          note: "Run anvil without --silent and it prints every transaction as it lands.",
+        },
     chain: ch.name,
     contract: address,
     explorer: ch.explorer ? `${ch.explorer}/address/${address}` : null,

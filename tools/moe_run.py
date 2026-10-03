@@ -46,11 +46,34 @@ def main():
     ap.add_argument("--prompt", type=int, nargs="+", default=[1, 7])
     ap.add_argument("--new", type=int, default=2, help="tokens to generate past the prompt")
     ap.add_argument("--out", default="artifacts")
+    ap.add_argument(
+        "--from-export",
+        nargs=2,
+        metavar=("BLOB_HEX", "META_JSON"),
+        help="score an already-exported blob instead of generating a synthetic one, so a "
+             "real checkpoint can be run through the contract rather than only through "
+             "the reference",
+    )
+    ap.add_argument("--name", default="moe", help="artifact prefix")
     a = ap.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))
-    hexfile = os.path.join(a.out, "moe_synth.hex")
     os.makedirs(a.out, exist_ok=True)
+
+    if a.from_export:
+        src_hex, src_meta = a.from_export
+        raw = bytes.fromhex(open(src_hex).read().strip())
+        meta = json.load(open(src_meta))
+        cfg = dict(meta)
+        hexfile = os.path.join(a.out, f"{a.name}_synth.hex")
+        with open(hexfile, "w") as f:
+            f.write(raw.hex())
+        a.dim, a.hidden, a.layers = cfg["dim"], cfg["hidden"], cfg["n_layers"]
+        a.vocab, a.heads, a.kv_heads = cfg["vocab"], cfg["n_heads"], cfg["n_kv"]
+        a.seqlen, a.experts, a.top_k = cfg["seqlen"], cfg["n_experts"], cfg["top_k"]
+        return _score(a, raw, cfg, hexfile)
+
+    hexfile = os.path.join(a.out, f"{a.name}_synth.hex")
 
     subprocess.run(
         [
@@ -69,6 +92,11 @@ def main():
         a.dim, a.hidden, a.layers, a.vocab, a.heads, a.kv_heads, a.seqlen,
         n_experts=a.experts, top_k=a.top_k,
     )
+    return _score(a, raw, cfg, hexfile)
+
+
+def _score(a, raw, cfg, hexfile):
+    """Run the reference over the blob and write what it emits."""
     w, sh, cos, sin = blobmod.read(raw, cfg)
     m = Model(cfg, w, sh, cos, sin)
 
@@ -103,7 +131,8 @@ def main():
         "logits0": [str(v) for v in logits0[: min(16, a.vocab)]],
         "argmax0": __import__("intref").argmax(logits0),
     }
-    path = os.path.join(a.out, "moe_run.json")
+    out["cfg"]["shared"] = cfg.get("shared", True)
+    path = os.path.join(a.out, f"{a.name}_run.json")
     with open(path, "w") as f:
         json.dump(out, f, indent=2)
 

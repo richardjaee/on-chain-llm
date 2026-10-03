@@ -8,7 +8,8 @@
     "n_kv": 2,
     "seqlen": 8,
     "n_experts": 4,
-    "top_k": 2
+    "top_k": 2,
+    "shared": true
   },
   "prompt": [
     1,

@@ -31,9 +31,14 @@ contract MixtureRunTest is Test {
 
     function setUp() public {
         string memory root = vm.projectRoot();
-        spec = vm.readFile(string.concat(root, "/artifacts/moe_run.json"));
-        bytes memory blob =
-            vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/moe_synth.hex"))));
+        // Which fixture, so one test serves both the synthetic mixture and a real Mixtral
+        // exported from HuggingFace. Defaults to the synthetic one, which needs no
+        // checkpoint to regenerate.
+        string memory name = vm.envOr("MOE_FIXTURE", string("moe"));
+        spec = vm.readFile(string.concat(root, "/artifacts/", name, "_run.json"));
+        bytes memory blob = vm.parseBytes(
+            string.concat("0x", vm.readFile(string.concat(root, "/artifacts/", name, "_synth.hex")))
+        );
         bytes memory table =
             vm.parseBytes(string.concat("0x", vm.readFile(string.concat(root, "/artifacts/tokens.hex"))));
 
@@ -73,7 +78,10 @@ contract MixtureRunTest is Test {
             seqLen: uint32(spec.readUint(".cfg.seqlen")),
             hs: hs,
             kvd: hs * kv,
-            shared: true,
+            // A real Mixtral ships an untied classifier, which moves every offset after
+            // rms_final. Read rather than assumed, because a wrong answer here is a blob
+            // the contract reads at the wrong place.
+            shared: spec.readBool(".cfg.shared"),
             invSqrtHs: uint64((uint256(1) << 64) / FixedPoint.isqrt(uint256(hs) << 64)),
             nExperts: uint32(spec.readUint(".cfg.n_experts")),
             topK: uint32(spec.readUint(".cfg.top_k"))

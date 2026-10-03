@@ -69,6 +69,17 @@ def main():
           f"head_dim {hs}, vocab {V}, experts {E}, top-k {K}")
 
     t = read_safetensors(os.path.join(a.model, "model.safetensors"))
+    missing = [
+        n for n in (f"model.layers.0.block_sparse_moe.experts.0.{w}.weight" for w in ("w1", "w2", "w3"))
+        if n not in t
+    ]
+    if missing:
+        raise SystemExit(
+            "checkpoint does not use the block_sparse_moe naming this reads: missing "
+            f"{missing[0]}. A checkpoint storing experts fused as mlp.experts.gate_up_proj "
+            "needs splitting first, and the two halves are shape-identical, so that split "
+            "cannot be inferred from the file."
+        )
     g = lambda n: t[n].astype(np.float64)
     shared = "lm_head.weight" not in t
 
@@ -76,19 +87,24 @@ def main():
         """One tensor per layer, stacked, which is how the blob orders them."""
         return np.concatenate([g(f"model.layers.{l}.{name}").reshape(-1) for l in range(L)])
 
-    def experts(name, per_expert):
-        """One tensor per (layer, expert), stacked in that order.
+    def experts(which):
+        """One expert projection per (layer, expert), stacked in that order.
 
         `expertRow` in the contract is `(layer * experts + expert) * rowsEach`, so layer 0's
         experts come before layer 1's. Getting this order wrong reads another expert's
         weights, which is a wrong answer rather than an error.
+
+        `which` is `w1`, `w2` or `w3`, the names transformers gives these: gate, down and
+        up respectively. Using them rather than a fused tensor is what removes the only
+        ambiguity here — a fused `gate_up_proj` has two shape-identical halves, so reading
+        them in the wrong order computes `up * silu(gate)` and every structural check still
+        passes. Named projections cannot be swapped silently.
         """
-        out = []
-        for l in range(L):
-            w = g(f"model.layers.{l}.mlp.experts.{name}")
-            for e in range(E):
-                out.append(per_expert(w, e).reshape(-1))
-        return np.concatenate(out)
+        return np.concatenate([
+            g(f"model.layers.{l}.block_sparse_moe.experts.{e}.{which}.weight").reshape(-1)
+            for l in range(L)
+            for e in range(E)
+        ])
 
     parts = []
     parts.append(block(g("model.embed_tokens.weight").reshape(-1), V, dim))
@@ -99,26 +115,12 @@ def main():
     parts.append(block(layers("self_attn.o_proj.weight"), L * dim, dim))
     parts.append(block(layers("post_attention_layernorm.weight"), 1, L * dim))
 
-    # The router, one score row per expert. `mlp.gate` is HuggingFace's name for it, which
-    # collides with the feed-forward's gate projection; they are different tensors.
-    parts.append(block(layers("mlp.gate.weight"), L * E, dim))
+    # The router, one score row per expert.
+    parts.append(block(layers("block_sparse_moe.gate.weight"), L * E, dim))
 
-    # `gate_up_proj` is [experts, 2 * hidden, dim], gate first and up second. That is the
-    # documented default, and it is an assumption here rather than something checked: the
-    # two halves are shape-identical, so swapping them computes up * silu(gate) instead of
-    # silu(gate) * up and every structural check still passes. Verifying it needs a
-    # reference forward pass from transformers, which this repository does not have.
-    #
-    # The shape is checked, which catches a wrong intermediate size but not a swap.
-    for l in range(L):
-        got = t[f"model.layers.{l}.mlp.experts.gate_up_proj"].shape
-        assert tuple(got) == (E, 2 * hid, dim), f"layer {l}: gate_up_proj is {got}, expected {(E, 2 * hid, dim)}"
-        got = t[f"model.layers.{l}.mlp.experts.down_proj"].shape
-        assert tuple(got) == (E, dim, hid), f"layer {l}: down_proj is {got}, expected {(E, dim, hid)}"
-
-    parts.append(block(experts("gate_up_proj", lambda w, e: w[e][:hid]), L * E * hid, dim))
-    parts.append(block(experts("down_proj", lambda w, e: w[e]), L * E * dim, hid))
-    parts.append(block(experts("gate_up_proj", lambda w, e: w[e][hid:]), L * E * hid, dim))
+    parts.append(block(experts("w1"), L * E * hid, dim))   # gate
+    parts.append(block(experts("w2"), L * E * dim, hid))   # down
+    parts.append(block(experts("w3"), L * E * hid, dim))   # up
 
     parts.append(block(g("model.norm.weight").reshape(-1), 1, dim))
     if not shared:

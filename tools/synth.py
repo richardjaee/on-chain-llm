@@ -39,6 +39,13 @@ def main():
     p.add_argument("--heads", type=int, required=True)
     p.add_argument("--kv-heads", type=int, required=True)
     p.add_argument("--seqlen", type=int, required=True)
+    p.add_argument(
+        "--experts",
+        type=int,
+        default=0,
+        help="experts per layer; 0 or 1 is dense and lays out byte for byte as before",
+    )
+    p.add_argument("--top-k", type=int, default=0, help="experts a token visits")
     p.add_argument("--out", required=True)
     a = p.parse_args()
 
@@ -46,6 +53,13 @@ def main():
     hs = dim // a.heads
     kvd = hs * a.kv_heads
     assert dim % a.heads == 0 and a.heads % a.kv_heads == 0, "head geometry must divide"
+
+    # One expert is the dense case rather than a special case of it, so every size below
+    # multiplies by E and a dense blob comes out byte for byte as it did before there was
+    # an expert axis. Transformer.sol derives its offsets the same way; LayoutTest pins it.
+    E = a.experts if a.experts else 1
+    if E > 1:
+        assert 1 <= a.top_k <= E, "top-k must be between one and the expert count"
 
     parts = []
     parts.append(block(V, dim, "tok"))            # tok_emb
@@ -55,9 +69,12 @@ def main():
     parts.append(block(L * kvd, dim, "wv"))
     parts.append(block(L * dim, dim, "wo"))
     parts.append(block(1, L * dim, "rmsf"))       # rms_ffn
-    parts.append(block(L * hid, dim, "w1"))
-    parts.append(block(L * dim, hid, "w2"))
-    parts.append(block(L * hid, dim, "w3"))
+    if E > 1:
+        # The router sits between the norm and the experts, one score row per expert.
+        parts.append(block(L * E, dim, "router"))
+    parts.append(block(L * E * hid, dim, "w1"))
+    parts.append(block(L * E * dim, hid, "w2"))
+    parts.append(block(L * E * hid, dim, "w3"))
     parts.append(block(1, dim, "rmsfin"))         # rms_final (classifier shares tok_emb)
 
     # RoPE tables, Q30 cos/sin per position and pair

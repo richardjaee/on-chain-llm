@@ -8,6 +8,7 @@ Everything is integer. This module is the specification the Solidity must
 reproduce bit for bit.
 """
 from intref import ONE, F, isqrt, exp_q32, silu, argmax, EPS_Q32
+from moeref import top_k, route_weights, visit_order
 
 
 class Model:
@@ -43,6 +44,29 @@ class Model:
                 acc += w[off + j] * x[j]
             out.append(acc >> sh[r])
         return out
+
+    def _n_experts(self):
+        return self.c.get("n_experts") or 1
+
+    def _experts(self, l, xb):
+        """Which experts this position visits, and what each counts for.
+
+        A dense layer yields its one expert with a weight of `None` rather than of `ONE`.
+        Scaling by one and shifting back is an identity only if nothing rounds, and the
+        contract takes the same branch for the same reason — a dense model must compute
+        what it computed before there was an expert axis, bit for bit.
+
+        Experts are visited in index order. The sum over them is integer and therefore
+        associative, so the order cannot change the result; it is fixed because a reader
+        has no way to know that without checking.
+        """
+        E = self._n_experts()
+        if E == 1:
+            return [(0, None)]
+        scores = self._matmul("router", l * E, E, self.c["dim"], xb)
+        chosen = top_k(scores, self.c["top_k"])
+        weights = route_weights(chosen)
+        return [(chosen[slot][0], weights[slot]) for slot in visit_order(chosen)]
 
     def _rope(self, vec, n_heads, pos):
         hs = self.c["hs"]
@@ -99,12 +123,21 @@ class Model:
 
             xb = self._rmsnorm(x, "rms_ffn", l * dim, dim)
             hid = c["hidden"]
-            h1 = self._matmul("w1", l * hid, hid, dim, xb)
-            h3 = self._matmul("w3", l * hid, hid, dim, xb)
-            hb = [(silu(h1[i]) * h3[i]) >> F for i in range(hid)]
-            xo = self._matmul("w2", l * dim, dim, hid, hb)
-            for i in range(dim):
-                x[i] += xo[i]
+            for e, weight in self._experts(l, xb):
+                # Row addressing is (layer * experts + expert), which collapses to
+                # `l * hidden` when there is one expert — so the dense path below is the
+                # same arithmetic, not a separate case. Transformer.expertRow agrees.
+                base = l * self._n_experts() + e
+                h1 = self._matmul("w1", base * hid, hid, dim, xb)
+                h3 = self._matmul("w3", base * hid, hid, dim, xb)
+                hb = [(silu(h1[i]) * h3[i]) >> F for i in range(hid)]
+                xo = self._matmul("w2", base * dim, dim, hid, hb)
+                if weight is None:
+                    for i in range(dim):
+                        x[i] += xo[i]
+                else:
+                    for i in range(dim):
+                        x[i] += (xo[i] * weight) >> F
 
         x = self._rmsnorm(x, "rms_final", 0, dim)
         return self._matmul("wcls", 0, c["vocab"], dim, x)

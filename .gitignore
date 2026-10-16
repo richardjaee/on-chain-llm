@@ -24,3 +24,6 @@ artifacts/synth-*.hex
 
 # Converted model blobs and reference vectors — large, regenerable
 artifacts/synth-smol135m.hex
+
+# Personal correspondence, not part of the project
+reply-to-dave.txt

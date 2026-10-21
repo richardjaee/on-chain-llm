@@ -4,6 +4,9 @@ A language model that runs **entirely inside Ethereum transactions** — no oper
 off-chain compute, no trusted anything. The prompt goes in as token ids and every
 multiply-accumulate executes as EVM opcodes.
 
+**[Read the technical report](https://richardjaee.github.io/on-chain-llm/)** for the
+design, the measurements, and the limits.
+
 Live on Base Sepolia, two deployments:
 
 | model | parameters | weights | address |

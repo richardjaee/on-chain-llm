@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>on-chain-llm: a transformer inside the EVM</title>
+<meta name="description" content="An integer-only transformer running as EVM bytecode, live on Base Sepolia, with the measurements behind it.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* A typeset technical report. Hairline rules instead of cards, one accent, and
+   monospace treated as content rather than as code-block decoration: on these pages
+   the digests and gas figures are the argument. */
+:root {
+  --paper:#f6f7f8; --panel:#fdfdfd; --ink:#15191d; --ink-soft:#4c565f;
+  --rule:#d3d8dc; --accent:#1f4e79; --verified:#1d5c45;
+  --serif:"Spectral","Iowan Old Style",Georgia,serif;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --paper:#14171a; --panel:#1a1e22; --ink:#e6e9ec; --ink-soft:#9aa5ae;
+  --rule:#333a41; --accent:#7fb3e0; --verified:#6fc3a0; color-scheme:dark;}}
+:root[data-theme="dark"]{
+  --paper:#14171a; --panel:#1a1e22; --ink:#e6e9ec; --ink-soft:#9aa5ae;
+  --rule:#333a41; --accent:#7fb3e0; --verified:#6fc3a0; color-scheme:dark;}
+
+*{box-sizing:border-box}
+body{background:var(--paper);color:var(--ink);font-family:var(--serif);
+  font-size:17px;line-height:1.6;margin:0;-webkit-text-size-adjust:100%}
+.wrap{max-width:1040px;margin:0 auto;padding:56px 24px 88px}
+.measure{max-width:64ch}
+
+.masthead{border-bottom:2px solid var(--ink);padding-bottom:20px}
+.kicker{font-family:var(--sans);font-size:11.5px;font-weight:600;
+  letter-spacing:.14em;text-transform:uppercase;color:var(--ink-soft)}
+h1{font-weight:600;font-size:clamp(28px,5.2vw,44px);line-height:1.12;
+  margin:12px 0 14px;text-wrap:balance;letter-spacing:-.012em}
+.standfirst{font-size:19px;color:var(--ink-soft);margin:0;max-width:60ch}
+.byline{font-family:var(--mono);font-size:12.5px;color:var(--ink-soft);
+  margin-top:22px;display:flex;flex-wrap:wrap;gap:6px 18px}
+
+h2{font-weight:600;font-size:25px;letter-spacing:-.008em;margin:56px 0 4px;
+  padding-top:18px;border-top:1px solid var(--rule);display:flex;gap:14px;
+  align-items:baseline;text-wrap:balance}
+h2 .num{font-family:var(--mono);font-size:13px;font-weight:500;
+  color:var(--accent);flex:none;padding-top:4px}
+h3{font-family:var(--sans);font-weight:600;font-size:14px;letter-spacing:.04em;
+  text-transform:uppercase;color:var(--ink-soft);margin:34px 0 10px}
+p{margin:0 0 16px}
+a{color:var(--accent);text-decoration-thickness:1px;text-underline-offset:2px}
+code{font-family:var(--mono);font-size:.9em}
+strong{font-weight:600}
+
+.fig{border:1px solid var(--rule);background:var(--panel);margin:26px 0;overflow-x:auto}
+.fig-head{font-family:var(--sans);font-size:11.5px;font-weight:600;
+  letter-spacing:.1em;text-transform:uppercase;color:var(--ink-soft);
+  padding:11px 16px;border-bottom:1px solid var(--rule)}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{text-align:left;padding:9px 16px;border-bottom:1px solid var(--rule);vertical-align:top}
+tbody tr:last-child td{border-bottom:0}
+th{font-family:var(--sans);font-weight:600;font-size:11.5px;letter-spacing:.06em;
+  text-transform:uppercase;color:var(--ink-soft)}
+td.n,td.m{font-family:var(--mono);font-variant-numeric:tabular-nums;white-space:nowrap}
+td.n{text-align:right}
+.ok{color:var(--verified);font-family:var(--mono);font-size:13px}
+.dg{font-family:var(--mono);font-size:12px;word-break:break-all;white-space:normal}
+
+pre{font-family:var(--mono);font-size:13px;line-height:1.55;background:var(--panel);
+  border:1px solid var(--rule);padding:14px 16px;margin:22px 0;overflow-x:auto}
+.lede-mono{font-family:var(--mono);font-size:13px;color:var(--ink-soft);
+  border-left:2px solid var(--accent);padding:2px 0 2px 14px;margin:22px 0}
+ul{margin:0 0 16px;padding-left:20px}
+li{margin-bottom:7px}
+.caveat{font-size:15.5px;color:var(--ink-soft);font-style:italic}
+.foot{margin-top:64px;padding-top:18px;border-top:1px solid var(--rule);
+  font-family:var(--mono);font-size:12.5px;color:var(--ink-soft)}
+.foot p{margin:0 0 8px}
+@media (max-width:520px){.wrap{padding:36px 16px 64px}body{font-size:16px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="masthead measure">
+    <div class="kicker">Technical report &middot; on-chain-llm</div>
+    <h1>A transformer that runs inside the Ethereum Virtual Machine</h1>
+    <p class="standfirst">Stock EVM, no precompiles, no custom node, nothing computed off
+      chain. Two models are live on Base Sepolia and generate text from contract storage.</p>
+    <div class="byline">
+      <span>Richard Chung</span>
+      <a href="https://github.com/richardjaee/on-chain-llm">github.com/richardjaee/on-chain-llm</a>
+      <a href="https://richardjaee.github.io/tensor-evm/">companion report: tensor-evm</a>
+    </div>
+  </header>
+
+  <section class="measure">
+    <h2><span class="num">1</span> Why this was thought impossible</h2>
+    <p>When a language model answers a question, there is no way to check that the model
+      you paid for is the model that ran. The weights sit on someone else's hardware, the
+      arithmetic happened in a process you cannot inspect, and the log recording it is
+      written by the party you would be auditing.</p>
+    <p>The usual remedies add a trusted component. Zero-knowledge proofs move the
+      computation off chain and verify a proof instead, at a cost between one hundred and
+      ten thousand times plain inference. Trusted execution environments cost about five
+      percent but require trusting a hardware vendor whose enclaves have been broken
+      repeatedly. Optimistic schemes assume an honest challenger appears inside a dispute
+      window.</p>
+    <p>A fourth option needs none of them. If every node recomputes the inference
+      independently and they all agree, the answer is verified by consensus, the same
+      mechanism that verifies a token transfer. Nobody has to be trusted. The reason that
+      option is usually dismissed is specific:</p>
+    <div class="lede-mono">Floating-point addition is not associative, so the order a sum
+      accumulates in changes its last bits. GPU reduction order varies with the kernel
+      selected, the thread count, and the batch a request lands in. Two honest machines
+      running the same weights on the same prompt return different logits.</div>
+    <p>If honest nodes can disagree, a disagreement carries no information and consensus
+      has nothing to work with. Integer addition is associative, integer multiplication is
+      exact within its width, and no rounding mode is left to the implementation. Make the
+      entire forward pass integer and reduction order stops mattering, which makes
+      reproduction free rather than expensive.</p>
+    <p>Everything below is built on that one observation.</p>
+  </section>
+
+  <section>
+    <div class="measure">
+      <h2><span class="num">2</span> What is deployed</h2>
+      <p>Every multiply-accumulate in these contracts executes as EVM opcodes. Weights are
+        quantised to 16-bit integers with a power-of-two scale per row, activations are Q32
+        fixed point, and accumulation happens in 128 bits. The prompt goes in as token ids
+        and the answer comes out of storage. The chain is one the author does not control.</p>
+    </div>
+    <div class="fig">
+      <div class="fig-head">Live on Base Sepolia, readable by anyone</div>
+      <table>
+        <thead><tr><th>Model</th><th>Parameters</th><th>Weights on chain</th><th>Address</th></tr></thead>
+        <tbody>
+          <tr><td>stories15M</td><td class="m">15.19M</td>
+            <td class="m">30.5 MB, 1,241 chunks</td>
+            <td class="m"><a href="https://sepolia.basescan.org/address/0x676Ef269b1Fe68129cE7D8001349d6802b9E339e">0x676Ef269&hellip;339e</a></td></tr>
+          <tr><td>stories260K</td><td class="m">0.28M</td>
+            <td class="m">0.6 MB, 22 chunks</td>
+            <td class="m"><a href="https://sepolia.basescan.org/address/0xc2ff49e48a5E7e2e472e6858610cF92BFbcd0e1C">0xc2ff49E4&hellip;0e1C</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="measure">
+      <p>Calling <code>text()</code> on the first address returns a sentence the contract
+        produced itself:</p>
+    </div>
+    <pre>Once upon a time, there was a little girl
+
+stories15M &middot; 6 tokens &middot; 1,001 transactions &middot; 8.83B gas &middot; 6.5 minutes</pre>
+    <div class="measure">
+      <p>The output matches the Python specification token for token. Those figures describe
+        that particular run rather than the model, because cost rises with position as
+        attention reads more of the key-value cache.</p>
+    </div>
+  </section>
+
+  <section class="measure">
+    <h2><span class="num">3</span> How a forward pass fits in a block</h2>
+    <h3>Resumable inference</h3>
+    <p>A single forward pass costs far more gas than any RPC provider accepts in one
+      transaction, roughly fifteen million in practice. That limit is separate from the
+      block gas limit, so the model could never be run by simply calling it, however large
+      blocks became.</p>
+    <p>The contract removes that ceiling by making inference resumable. Each step runs one
+      or more layers for the current position, then checkpoints the residual stream and
+      that layer's key-value cache row into storage. The next transaction reloads and
+      continues. Total compute is unbounded while each transaction stays small, which is
+      why one sentence takes a thousand transactions rather than one.</p>
+
+    <h3>Weights as code, not storage</h3>
+    <p>Holding 30.5 MB in contract storage would cost twenty thousand gas per
+      thirty-two bytes. Deploying the same bytes as contract <em>code</em> and reading them
+      with <code>EXTCODECOPY</code> costs roughly a third of that. The weights live across
+      1,241 data contracts, and the addresses of those contracts are themselves stored as
+      data contracts, because one directory holds at most 1,228 of them.</p>
+  </section>
+
+  <section>
+    <div class="measure">
+      <h2><span class="num">4</span> Mixture of experts</h2>
+      <p>Gas follows the parameters a token reads, and a dense layer reads all of them. A
+        router that visits two experts of eight skips most of the layer, and every skipped
+        chunk is a data contract never touched. Sparsity is the one change that moves the
+        ceiling by an order of magnitude rather than a few percent.</p>
+      <p>Two things have to be reproducible here. The arithmetic, as everywhere. And which
+        experts are chosen, which is the sharper requirement: a tie broken differently is
+        not a rounding difference, it routes the token through different parameters, so two
+        honest nodes emit different text and the chain forks. Ties go to the lower index,
+        everywhere, and that rule is tested rather than assumed.</p>
+    </div>
+    <div class="fig">
+      <div class="fig-head">Checked against external references</div>
+      <table>
+        <tbody>
+          <tr><td>Routing agrees with two independent implementations</td>
+              <td class="n">18 vectors</td><td class="ok">pass</td></tr>
+          <tr><td>Vectors built for ties: all scores equal, a tie at the top, every exponent underflowing</td>
+              <td class="n">3 cases</td><td class="ok">pass</td></tr>
+          <tr><td>A one-expert mixture produces a blob byte-identical to dense</td>
+              <td class="m">sha 496bc3d4bbc7e9fd</td><td class="ok">pass</td></tr>
+          <tr><td>Four-expert mixture generates the specification's tokens on chain</td>
+              <td class="m">[149, 260]</td><td class="ok">63 phases</td></tr>
+          <tr><td>A real Mixtral checkpoint, argmax against transformers 4.57.6</td>
+              <td class="m">94, 9, 100</td><td class="ok">3 of 3</td></tr>
+          <tr><td>Dense path unchanged, full suite</td>
+              <td class="n">29 tests</td><td class="ok">0 failed</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="measure">
+      <p>The last row carries more weight than the others. Adding an expert axis to a model
+        already deployed is only legitimate if the deployed model still computes exactly
+        what it computed before, and that is checked rather than claimed.</p>
+    </div>
+  </section>
+
+  <section class="measure">
+    <h2><span class="num">5</span> Limits</h2>
+    <p><strong>Cost is real.</strong> On Base mainnet at current prices, the 8.83 billion
+      gas that produced six tokens of TinyStories would cost roughly 159 dollars, about
+      26 dollars a token, against something near a hundredth of a cent for a hosted model.
+      Public rollups price generic computation for transfers and swaps. Serving a model this
+      way needs an execution environment whose gas schedule you set yourself.</p>
+    <p><strong>Every input is public.</strong> Re-execution requires each validator to see
+      the prompt, so this architecture cannot serve confidential data, and the weights must
+      be published for the same reason. A closed model cannot run here.</p>
+    <p><strong>Context is bounded.</strong> Attention grows with position. Running more
+      layers per transaction moved the reachable position from 48 to 286, and
+      <code>test_FindStrandPosition</code> pins where a run strands.</p>
+    <p><strong>Scale is the open problem.</strong> At one billion parameters a token needs
+      on the order of ten thousand transactions, roughly a hundred blocks of sequencer
+      capacity with nothing else in them, after depositing gigabytes of weights across tens
+      of thousands of contracts.</p>
+    <p>The last two points are what the companion project exists to attack. If the
+      interpreter is the constraint rather than gas, the next question is what happens when
+      the virtual machine itself is changed.
+      <a href="https://richardjaee.github.io/tensor-evm/">That report is here.</a></p>
+  </section>
+
+  <div class="foot measure">
+    <p>Figures are measured, not projected. Addresses link to Base Sepolia, where the
+      contracts and their outputs can be read directly.</p>
+    <p>Source, tests and reproduction steps:
+      <a href="https://github.com/richardjaee/on-chain-llm">github.com/richardjaee/on-chain-llm</a></p>
+  </div>
+</div>
+</body>
+</html>

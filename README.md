@@ -1,4 +1,4 @@
-# onchain-llm
+# on-chain-llm
 
 A language model that runs **entirely inside Ethereum transactions** — no operators, no
 off-chain compute, no trusted anything. The prompt goes in as token ids and every
@@ -50,6 +50,7 @@ the work reorders independent operations and cannot change a single bit of the r
 | `FixedPoint.sol` | Q32 `isqrt`, `expQ32`, `silu`, `argmax` |
 | `WeightStore.sol` | Weights as contract bytecode, with arbitrary-range streaming reads |
 | `Decoder.sol` | Token ids back to UTF-8 from an on-chain table |
+| `Mixture.sol` | Router top-k, weights, visit order — ties to the lower index |
 
 Weights live as contract bytecode — 22 data contracts for stories260K, 1241 for
 stories15M — read with `EXTCODECOPY`. Chunk addresses are themselves stored as data
@@ -62,7 +63,11 @@ capped any model at ~30 MB. Nothing is precomputed; contract storage holds no ou
 |---|---|
 | `tools/convert.py` | checkpoint → quantised blob (`--blob`) |
 | `tools/toktable.py` | tokenizer → on-chain token table |
-| `tools/synth.py` | correctly shaped blobs at arbitrary width, for scaling experiments |
+| `tools/synth.py` | correctly shaped blobs at arbitrary width, `--experts` for a mixture |
+| `tools/export_mixtral.py` | a Mixtral checkpoint → mixture blob, checked against `transformers` |
+| `tools/blob.py` | the on-chain layout, read back; offsets derived independently of the contract |
+| `tools/moeref.py` | the routing specification — top-k, weights, visit order |
+| `tools/moe_run.py` | what a mixture should emit, for the contract to be asked |
 | `tools/model.py`, `intref.py` | the integer specification everything is checked against |
 | `tools/llama2-reference.c` | llama2.c's `run.c`, vendored unmodified |
 
@@ -108,6 +113,32 @@ every layer is pinned to the one below it — and never to another implementatio
 ```bash
 forge test
 ```
+
+## Mixture of experts
+
+Gas follows the parameters a token *reads*, and a dense layer reads all of them. A router
+that picks 2 experts of 8 skips most of the layer, and every skipped chunk is a data
+contract never touched — which is why a mixture is the one change that moves this
+project's ceiling by an order of magnitude rather than a few percent. The budget is in
+[`docs/scaling-to-1b.md`](docs/scaling-to-1b.md).
+
+Two things have to be reproducible, and the second is the one that bites. The arithmetic,
+as everywhere here. And **which experts are chosen**: a tie broken differently is not a
+rounding difference, it sends the token through different parameters, so two honest nodes
+emit different text and the chain forks. Ties go to the lower index, everywhere, always.
+
+- routing agrees with two other implementations across 18 vectors chosen for their ties —
+  every score equal, a tie at the top, scores far enough apart that every exponent
+  underflows
+- one expert is the dense case rather than a special case of it: `--experts 1` and no flag
+  at all produce the same blob, and `LayoutTest` pins the offsets
+- a 4-expert mixture generates the specification's tokens on chain — `[149, 260]` from
+  prompt `[1, 7]`, 63 phases
+- a **real Mixtral checkpoint** exported from HuggingFace runs too, untied classifier and
+  all, and its integer path agrees with `transformers` 4.57.6 argmax-for-argmax
+
+The dense path is untouched by any of it, which is checked rather than asserted — the two
+deployments above still reproduce their recorded token sequences bit for bit.
 
 ## Running it
 
